@@ -23,21 +23,6 @@ st.markdown("""
         color: #555;
         margin-bottom: 1.5rem;
     }
-    .metric-box {
-        background: #f0f4f8;
-        border-radius: 10px;
-        padding: 1rem;
-        text-align: center;
-    }
-    .metric-num {
-        font-size: 2rem;
-        font-weight: 700;
-        color: #1F4E79;
-    }
-    .metric-label {
-        font-size: 0.8rem;
-        color: #555;
-    }
     .rule-box {
         background: #f8f9fa;
         border-left: 4px solid #1F4E79;
@@ -61,7 +46,7 @@ with st.expander("📌 整備ルールを確認する"):
 <b>【自動整備の内容】</b><br>
 ✅ 全角→半角変換・前後スペース除去<br>
 ✅ 郵便番号の正規化（xxx-xxxx形式に統一）<br>
-✅ 都道府県が抜けている場合は郵便番号から補完<br>
+✅ 都道府県が抜けている場合、郵便番号または市区町村名から補完<br>
 ✅ オーナー住所が空欄の場合、郵便番号から補完（物件住所との混同は禁止）<br>
 ✅ 郵便番号が不正な場合、オーナー住所から逆引き補完<br>
 ✅ 重複行の削除（オーナー名＋住所＋郵便番号が一致）<br>
@@ -71,7 +56,9 @@ with st.expander("📌 整備ルールを確認する"):
 ❌ オーナー名が未入力<br>
 ❌ オーナー住所が未入力（補完不可）<br>
 ❌ 郵便番号が未入力または不正（逆引き不可）<br>
-❌ 文字化けの疑いがある
+❌ 文字化けの疑いがある<br><br>
+<b>【処理時間の目安】</b><br>
+郵便番号の逆引き補完が多い場合は1〜2分かかることがあります。
 </div>
 """, unsafe_allow_html=True)
 
@@ -97,21 +84,23 @@ if uploaded:
         uploaded.seek(0)
         file_bytes = uploaded.read()
 
-        progress_area = st.empty()
-        status_msgs = []
+        status_area = st.empty()
+        progress_bar = st.progress(0)
 
-        def on_progress(msg):
-            status_msgs.append(msg)
-            progress_area.info("⏳ " + msg)
+        def on_progress(msg, progress=None):
+            status_area.info("⏳ " + msg)
+            if progress is not None:
+                progress_bar.progress(min(progress, 1.0))
 
-        with st.spinner("整備処理を実行中です。郵便番号の補完がある場合は少しお時間がかかります..."):
-            try:
-                excel_bytes, summary, error_list = process(file_bytes, on_progress)
-            except Exception as e:
-                st.error(f"処理中にエラーが発生しました: {e}")
-                st.stop()
+        try:
+            excel_bytes, summary, error_list = process(file_bytes, on_progress)
+        except Exception as e:
+            st.error(f"処理中にエラーが発生しました: {e}")
+            st.stop()
 
-        progress_area.empty()
+        progress_bar.progress(1.0)
+        status_area.empty()
+        progress_bar.empty()
         st.success("✅ 整備が完了しました！")
         st.divider()
 

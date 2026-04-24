@@ -219,9 +219,9 @@ def process(file_bytes, progress_callback=None):
     progress_callback: callable(message: str) | None  進捗通知用
     戻り値: (excel_bytes, summary_dict, error_list)
     """
-    def notify(msg):
+    def notify(msg, progress=None):
         if progress_callback:
-            progress_callback(msg)
+            progress_callback(msg, progress)
 
     df_raw = pd.read_excel(io.BytesIO(file_bytes), header=0)
     col_map = detect_columns(df_raw)
@@ -248,10 +248,13 @@ def process(file_bytes, progress_callback=None):
         }
         raw_rows.append(r)
 
-    notify("郵便番号の正規化・住所補完を処理中...")
+    total = len(raw_rows)
+    notify(f"住所・郵便番号を補完中... (全{total}件)", 0.05)
 
     # ── 郵便番号正規化 & 各種補完 ──
-    for r in raw_rows:
+    for i, r in enumerate(raw_rows):
+        if (i + 1) % 5 == 0 or i == total - 1:
+            notify(f"住所・郵便番号を補完中... ({i+1}/{total}件)", 0.05 + 0.75 * (i + 1) / total)
         no = r['orig_no']
         postal_raw = r['郵便番号_raw']
         postal_norm = normalize_postal(postal_raw)
@@ -299,7 +302,7 @@ def process(file_bytes, progress_callback=None):
                 logs.append((no, f"オーナー住所から郵便番号を逆引きできず"))
             time.sleep(0.5)  # API レート制限対策
 
-    notify("重複削除・連名統合を処理中...")
+    notify("重複削除・連名統合を処理中...", 0.82)
 
     # ── 重複削除 ──
     dedup_rows = []
@@ -348,7 +351,7 @@ def process(file_bytes, progress_callback=None):
         else:
             final_rows.append(r)
 
-    notify("エラー判定・出力ファイル作成中...")
+    notify("エラー判定・出力ファイル作成中...", 0.92)
 
     # ── エラー判定 ──
     ok_rows = []
