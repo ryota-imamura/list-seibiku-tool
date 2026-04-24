@@ -83,6 +83,73 @@ def lookup_prefecture_from_postal(postal):
         return data['results'][0].get('address1')
     return None
 
+# 都道府県リスト
+_ALL_PREFS = [
+    '北海道','青森県','岩手県','宮城県','秋田県','山形県','福島県',
+    '茨城県','栃木県','群馬県','埼玉県','千葉県','東京都','神奈川県',
+    '新潟県','富山県','石川県','福井県','山梨県','長野県','岐阜県',
+    '静岡県','愛知県','三重県','滋賀県','京都府','大阪府','兵庫県',
+    '奈良県','和歌山県','鳥取県','島根県','岡山県','広島県','山口県',
+    '徳島県','香川県','愛媛県','高知県','福岡県','佐賀県','長崎県',
+    '熊本県','大分県','宮崎県','鹿児島県','沖縄県',
+]
+_CITY_PREF_CACHE = {}  # {city_name: pref}
+
+def _build_city_pref_cache():
+    """全都道府県の市区町村→都道府県マッピングをHeartRailsから構築（初回のみ）"""
+    global _CITY_PREF_CACHE
+    if _CITY_PREF_CACHE:
+        return
+    for pref in _ALL_PREFS:
+        url = f"https://geoapi.heartrails.com/api/json?method=getCities&prefecture={urllib.parse.quote(pref)}"
+        data = _get_json(url)
+        if not data:
+            continue
+        for loc in data.get('response', {}).get('location', []):
+            city_full = loc.get('city', '')
+            if not city_full:
+                continue
+            _CITY_PREF_CACHE[city_full] = pref
+            # 政令指定都市: 「北九州市小倉南区」→「北九州市」も登録
+            m = re.match(r'^(.+市)', city_full)
+            if m:
+                _CITY_PREF_CACHE.setdefault(m.group(1), pref)
+        time.sleep(0.05)
+
+def lookup_prefecture_from_city(address):
+    """住所の先頭から市区町村名を抽出して都道府県を逆引き"""
+    _build_city_pref_cache()
+    # 非欲張りで最短一致: 鳥栖市本鳥栖町→鳥栖市、北九州市小倉南区→北九州市
+    for pat in [r'^(.{2,12}?[市区町村])', r'^(.{2,6}?[市区町村])']:
+        m = re.match(pat, address)
+        if m:
+            city = m.group(1)
+            if city in _CITY_PREF_CACHE:
+                return _CITY_PREF_CACHE[city], city
+    return None, None
+
+def _extract_city_and_town(address):
+    """住所から都道府県除去済み文字列の市区町村と町域を抽出"""
+    # 非欲張りで最短の[市区町村]を市区町村名とする
+    city_m = re.match(r'^(.{2,10}?[市区町村])', address)
+    if not city_m:
+        return None, None
+    city = city_m.group(1)
+    town_rest = address[len(city):]
+    # 政令指定都市: 市の後に「○○区」が続く場合は区まで含める
+    if city.endswith('市'):
+        ku_m = re.match(r'^([^\d一二三四五六七八九十]+区)', town_rest)
+        if ku_m:
+            ku = ku_m.group(1)
+            city = city + ku
+            town_rest = town_rest[len(ku):]
+    # 大字・字 プレフィックスを除去
+    town_rest = re.sub(r'^[大小]?字', '', town_rest)
+    # 半角数字・ハイフン・漢数字の前で区切る
+    town_m = re.match(r'^([^\d\-ー－一二三四五六七八九十0-9]+)', town_rest)
+    town = town_m.group(1).strip() if town_m else ""
+    return city, town
+
 def lookup_postal_from_address(address):
     if not isinstance(address, str) or not address.strip():
         return None
@@ -91,14 +158,8 @@ def lookup_postal_from_address(address):
         return None
     pref = pref_m.group(1)
     rest = address[len(pref):]
-    city_m = re.match(r'^(.{2,10}[市区町村])', rest)
-    if not city_m:
-        return None
-    city = city_m.group(1)
-    town_rest = rest[len(city):]
-    town_m = re.match(r'^([^\d\-ー－一二三四五六七八九十]+)', town_rest)
-    town = town_m.group(1).strip() if town_m else ""
-    if not town:
+    city, town = _extract_city_and_town(rest)
+    if not city or not town:
         return None
     url = (
         "https://geoapi.heartrails.com/api/json?method=getTowns"
@@ -107,8 +168,10 @@ def lookup_postal_from_address(address):
     )
     data = _get_json(url)
     if data:
+        town_clean = re.sub(r'^[大小]?字', '', town)
         for loc in data.get('response', {}).get('location', []):
-            if loc.get('town', '').startswith(town):
+            loc_town = re.sub(r'^[大小]?字', '', loc.get('town', ''))
+            if loc_town.startswith(town_clean) or town_clean.startswith(loc_town):
                 p = loc['postal']
                 return f"{p[:3]}-{p[3:]}"
     return None
@@ -162,6 +225,11 @@ def process(file_bytes, progress_callback=None):
     df_raw = pd.read_excel(io.BytesIO(file_bytes), header=0)
     col_map = detect_columns(df_raw)
 
+    # 空行除去：オーナー名・オーナー住所・郵便番号がすべて空の行はスキップ
+    key_cols = [c for c in [col_map.get('オーナー名'), col_map.get('オーナー住所'), col_map.get('郵便番号')] if c]
+    if key_cols:
+        df_raw = df_raw[df_raw[key_cols].notna().any(axis=1)].reset_index(drop=True)
+
     logs, errors, raw_rows = [], [], []
     seen_keys = set()
     dup_count = addr_fill_count = postal_fill_count = merge_count = garbled_count = 0
@@ -191,16 +259,20 @@ def process(file_bytes, progress_callback=None):
             logs.append((no, f"郵便番号を正規化: 「{postal_raw}」→「{postal_norm}」"))
         r['郵便番号'] = postal_norm or ""
 
-        # 都道府県補完
+        # 都道府県補完（郵便番号優先 → 市区町村名から逆引き）
         if r['オーナー住所'] and not has_prefecture(r['オーナー住所']):
+            orig = r['オーナー住所']
             pref = lookup_prefecture_from_postal(r['郵便番号'])
+            method = "郵便番号から"
+            if not pref:
+                pref, _ = lookup_prefecture_from_city(orig)
+                method = "市区町村名から"
+                time.sleep(0.2)
             if pref:
-                orig = r['オーナー住所']
                 r['オーナー住所'] = pref + orig
-                logs.append((no, f"都道府県を補完（郵便番号から）: 「{orig}」→「{r['オーナー住所']}」"))
+                logs.append((no, f"都道府県を補完（{method}）: 「{orig}」→「{r['オーナー住所']}」"))
             else:
-                logs.append((no, f"都道府県を特定できず: 「{r['オーナー住所']}」"))
-            time.sleep(0.2)
+                logs.append((no, f"都道府県を特定できず: 「{orig}」"))
 
         # 郵便番号→住所補完（物件住所と一致する場合は禁止）
         if is_valid_postal(r['郵便番号']) and not r['オーナー住所']:
@@ -224,7 +296,7 @@ def process(file_bytes, progress_callback=None):
                 postal_fill_count += 1
             else:
                 logs.append((no, f"オーナー住所から郵便番号を逆引きできず"))
-            time.sleep(0.2)
+            time.sleep(0.5)  # API レート制限対策
 
     notify("重複削除・連名統合を処理中...")
 
