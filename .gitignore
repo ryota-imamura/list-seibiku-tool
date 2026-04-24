@@ -1,0 +1,8 @@
+*.xlsx
+*.xls
+.ngrok_token
+__pycache__/
+*.pyc
+.DS_Store
+process_list.py
+start.py
