@@ -114,7 +114,7 @@ def _build_city_pref_cache():
             m = re.match(r'^(.+市)', city_full)
             if m:
                 _CITY_PREF_CACHE.setdefault(m.group(1), pref)
-        time.sleep(0.05)
+        time.sleep(0.3)
 
 def lookup_prefecture_from_city(address):
     """住所の先頭から市区町村名を抽出して都道府県を逆引き"""
@@ -130,7 +130,6 @@ def lookup_prefecture_from_city(address):
 
 def _extract_city_and_town(address):
     """住所から都道府県除去済み文字列の市区町村と町域を抽出"""
-    # 非欲張りで最短の[市区町村]を市区町村名とする
     city_m = re.match(r'^(.{2,10}?[市区町村])', address)
     if not city_m:
         return None, None
@@ -145,9 +144,9 @@ def _extract_city_and_town(address):
             town_rest = town_rest[len(ku):]
     # 大字・字 プレフィックスを除去
     town_rest = re.sub(r'^[大小]?字', '', town_rest)
-    # 半角数字・ハイフン・漢数字の前で区切る
-    town_m = re.match(r'^([^\d\-ー－一二三四五六七八九十0-9]+)', town_rest)
-    town = town_m.group(1).strip() if town_m else ""
+    # 丁目/番地/番/号 の番号部分（算用数字・漢数字）以降を除去して町域名を取り出す
+    # 例: 五郎丸四丁目3番1→五郎丸, 水ヶ江二丁目→水ヶ江, 曽根崎町1208番地→曽根崎町
+    town = re.sub(r'[\d一二三四五六七八九十百千万]+(?:丁目|番地|番|号).*', '', town_rest).strip()
     return city, town
 
 def lookup_postal_from_address(address):
@@ -168,9 +167,11 @@ def lookup_postal_from_address(address):
     )
     data = _get_json(url)
     if data:
-        town_clean = re.sub(r'^[大小]?字', '', town)
+        def _kana_norm(s):
+            return s.replace('ヶ', 'ケ').replace('ヵ', 'カ')
+        town_clean = _kana_norm(re.sub(r'^[大小]?字', '', town))
         for loc in data.get('response', {}).get('location', []):
-            loc_town = re.sub(r'^[大小]?字', '', loc.get('town', ''))
+            loc_town = _kana_norm(re.sub(r'^[大小]?字', '', loc.get('town', '')))
             if loc_town.startswith(town_clean) or town_clean.startswith(loc_town):
                 p = loc['postal']
                 return f"{p[:3]}-{p[3:]}"
