@@ -23,12 +23,15 @@ if not st.session_state.authenticated:
     <div class="sub-title">認証が必要です</div>
     """, unsafe_allow_html=True)
 
-    password = st.text_input("パスワードを入力", type="password", label_visibility="collapsed")
-    if password == "seibi0000":
-        st.session_state.authenticated = True
-        st.rerun()
-    elif password:
-        st.error("❌ パスワードが間違っています")
+    with st.form(key='auth_form'):
+        password = st.text_input("パスワードを入力", type="password")
+        submit = st.form_submit_button("ログイン", use_container_width=True, type="primary")
+        if submit:
+            if password == "seibi0000":
+                st.session_state.authenticated = True
+                st.rerun()
+            else:
+                st.error("❌ パスワードが間違っています")
     st.stop()
 
 # ── スタイル ──────────────────────────────────────────────────────────
