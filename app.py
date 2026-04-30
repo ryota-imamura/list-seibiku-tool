@@ -9,6 +9,28 @@ st.set_page_config(
     layout="centered",
 )
 
+# ── 認証 ────────────────────────────────────────────────────────────────
+if "authenticated" not in st.session_state:
+    st.session_state.authenticated = False
+
+if not st.session_state.authenticated:
+    st.markdown("""
+    <style>
+        .main-title { font-size: 2rem; font-weight: 700; color: #1F4E79; margin-bottom: 0.2rem; }
+        .sub-title { font-size: 0.95rem; color: #555; margin-bottom: 1.5rem; }
+    </style>
+    <div class="main-title">📋 リスト整備ツール</div>
+    <div class="sub-title">認証が必要です</div>
+    """, unsafe_allow_html=True)
+
+    password = st.text_input("パスワードを入力", type="password", label_visibility="collapsed")
+    if password == "seibi0000":
+        st.session_state.authenticated = True
+        st.rerun()
+    elif password:
+        st.error("❌ パスワードが間違っています")
+    st.stop()
+
 # ── スタイル ──────────────────────────────────────────────────────────
 st.markdown("""
 <style>
