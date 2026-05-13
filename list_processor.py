@@ -142,12 +142,35 @@ def _extract_city_and_town(address):
             ku = ku_m.group(1)
             city = city + ku
             town_rest = town_rest[len(ku):]
-    # 大字・字 プレフィックスを除去
+    # 先頭の「大字/字」を除去
     town_rest = re.sub(r'^[大小]?字', '', town_rest)
-    # 丁目/番地/番/号 の番号部分（算用数字・漢数字）以降を除去して町域名を取り出す
-    # 例: 五郎丸四丁目3番1→五郎丸, 水ヶ江二丁目→水ヶ江, 曽根崎町1208番地→曽根崎町
+    # 丁目/番地/番/号 の番号部分以降を除去して町域名を取り出す
     town = re.sub(r'[\d一二三四五六七八九十百千万]+(?:丁目|番地|番|号).*', '', town_rest).strip()
+    # 中間に含まれる「大字/小字」も除去（例: 大和町大字尼寺 → 大和町尼寺）
+    town = re.sub(r'[大小]字', '', town).strip()
     return city, town
+
+def _heartrails_town_search(pref, city, town):
+    """HeartRails getTowns API で郵便番号を検索"""
+    url = (
+        "https://geoapi.heartrails.com/api/json?method=getTowns"
+        f"&prefecture={urllib.parse.quote(pref)}"
+        f"&city={urllib.parse.quote(city)}"
+    )
+    data = _get_json(url)
+    if not data:
+        return None
+    def _kana_norm(s):
+        return s.replace('ヶ', 'ケ').replace('ヵ', 'カ')
+    town_clean = _kana_norm(re.sub(r'^[大小]?字', '', town))
+    if not town_clean:
+        return None
+    for loc in data.get('response', {}).get('location', []):
+        loc_town = _kana_norm(re.sub(r'^[大小]?字', '', loc.get('town', '')))
+        if loc_town.startswith(town_clean) or town_clean.startswith(loc_town):
+            p = loc['postal']
+            return f"{p[:3]}-{p[3:]}"
+    return None
 
 def lookup_postal_from_address(address):
     if not isinstance(address, str) or not address.strip():
@@ -160,21 +183,22 @@ def lookup_postal_from_address(address):
     city, town = _extract_city_and_town(rest)
     if not city or not town:
         return None
-    url = (
-        "https://geoapi.heartrails.com/api/json?method=getTowns"
-        f"&prefecture={urllib.parse.quote(pref)}"
-        f"&city={urllib.parse.quote(city)}"
-    )
-    data = _get_json(url)
-    if data:
-        def _kana_norm(s):
-            return s.replace('ヶ', 'ケ').replace('ヵ', 'カ')
-        town_clean = _kana_norm(re.sub(r'^[大小]?字', '', town))
-        for loc in data.get('response', {}).get('location', []):
-            loc_town = _kana_norm(re.sub(r'^[大小]?字', '', loc.get('town', '')))
-            if loc_town.startswith(town_clean) or town_clean.startswith(loc_town):
-                p = loc['postal']
-                return f"{p[:3]}-{p[3:]}"
+
+    # まず通常の検索
+    result = _heartrails_town_search(pref, city, town)
+    if result:
+        return result
+
+    # フォールバック: 大字なしで town に「○○町/村」が含まれる場合、
+    # city に町/村まで含めて再検索（例: 小城市, 牛津町柿通瀬 → 小城市牛津町, 柿通瀬）
+    sub_m = re.match(r'^([^\d一二三四五六七八九十]+(?:町|村))(.+)', town)
+    if sub_m:
+        city2 = city + sub_m.group(1)
+        town2 = sub_m.group(2)
+        result = _heartrails_town_search(pref, city2, town2)
+        if result:
+            return result
+
     return None
 
 # ── 列マッピング ──────────────────────────────────────────────────────
