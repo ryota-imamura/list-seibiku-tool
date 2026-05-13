@@ -98,8 +98,39 @@ uploaded = st.file_uploader(
 )
 
 if uploaded:
-    df_preview = pd.read_excel(uploaded, header=0, nrows=5)
-    st.caption(f"ファイル名: `{uploaded.name}`　/ プレビュー（先頭5行）")
+    # ── シート選択 ────────────────────────────────────────────────────
+    xl = pd.ExcelFile(uploaded)
+    all_sheets = xl.sheet_names
+    uploaded.seek(0)
+
+    if len(all_sheets) > 1:
+        # データが入っているシートのみ抽出
+        valid_sheets = []
+        for sheet in all_sheets:
+            try:
+                df_tmp = pd.read_excel(uploaded, sheet_name=sheet, header=0, nrows=10)
+                uploaded.seek(0)
+                if 'オーナー名' in df_tmp.columns:
+                    real = df_tmp[~df_tmp.iloc[:, 0].astype(str).str.startswith('例')]
+                    if real['オーナー名'].notna().any():
+                        valid_sheets.append(sheet)
+            except Exception:
+                uploaded.seek(0)
+        if not valid_sheets:
+            valid_sheets = all_sheets
+
+        selected_sheet = st.selectbox(
+            "📄 処理するシートを選択してください",
+            valid_sheets,
+            help="データが入っているシートのみ表示しています"
+        )
+        uploaded.seek(0)
+    else:
+        selected_sheet = all_sheets[0]
+
+    df_preview = pd.read_excel(uploaded, sheet_name=selected_sheet, header=0, nrows=5)
+    uploaded.seek(0)
+    st.caption(f"ファイル名: `{uploaded.name}`　シート: `{selected_sheet}`　/ プレビュー（先頭5行）")
     st.dataframe(df_preview, use_container_width=True)
 
     st.divider()
@@ -118,7 +149,7 @@ if uploaded:
                 progress_bar.progress(min(progress, 1.0))
 
         try:
-            excel_bytes, summary, error_list = process(file_bytes, on_progress)
+            excel_bytes, summary, error_list = process(file_bytes, on_progress, sheet_name=selected_sheet)
         except Exception as e:
             st.error(f"処理中にエラーが発生しました: {e}")
             st.stop()

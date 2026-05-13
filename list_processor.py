@@ -213,17 +213,18 @@ def get_val(row, col_map, key):
 
 # ── メイン処理 ────────────────────────────────────────────────────────
 
-def process(file_bytes, progress_callback=None):
+def process(file_bytes, progress_callback=None, sheet_name=0):
     """
     file_bytes: bytes (Excelファイル)
-    progress_callback: callable(message: str) | None  進捗通知用
+    progress_callback: callable(message: str, progress: float) | None  進捗通知用
+    sheet_name: int | str  読み込むシート（デフォルト=先頭シート）
     戻り値: (excel_bytes, summary_dict, error_list)
     """
     def notify(msg, progress=None):
         if progress_callback:
             progress_callback(msg, progress)
 
-    df_raw = pd.read_excel(io.BytesIO(file_bytes), header=0)
+    df_raw = pd.read_excel(io.BytesIO(file_bytes), header=0, sheet_name=sheet_name)
     col_map = detect_columns(df_raw)
 
     # 空行除去：オーナー名・オーナー住所・郵便番号がすべて空の行はスキップ
