@@ -158,7 +158,11 @@ def _extract_city_and_town(address):
     return city, town
 
 def _heartrails_town_search(pref, city, town):
-    """HeartRails getTowns API で郵便番号を検索"""
+    """HeartRails getTowns API で郵便番号を検索
+
+    戻り値: (postal | None, info)
+      info = {'status': 'ok'|'city_not_found'|'town_not_matched', 'candidates': [...]}
+    """
     url = (
         "https://geoapi.heartrails.com/api/json?method=getTowns"
         f"&prefecture={urllib.parse.quote(pref)}"
@@ -166,35 +170,57 @@ def _heartrails_town_search(pref, city, town):
     )
     data = _get_json(url)
     if not data:
-        return None
+        return None, {'status': 'city_not_found', 'candidates': []}
+    locations = data.get('response', {}).get('location', [])
+    if not locations:
+        return None, {'status': 'city_not_found', 'candidates': []}
     def _kana_norm(s):
         return s.replace('ヶ', 'ケ').replace('ヵ', 'カ')
     town_clean = _kana_norm(re.sub(r'^[大小]?字', '', town))
     if not town_clean:
-        return None
-    for loc in data.get('response', {}).get('location', []):
+        return None, {'status': 'town_not_matched', 'candidates': []}
+    all_towns = [loc.get('town', '') for loc in locations if loc.get('town')]
+    for loc in locations:
         loc_town = _kana_norm(re.sub(r'^[大小]?字', '', loc.get('town', '')))
         if loc_town.startswith(town_clean) or town_clean.startswith(loc_town):
             p = loc['postal']
-            return f"{p[:3]}-{p[3:]}"
-    return None
+            return f"{p[:3]}-{p[3:]}", {'status': 'ok', 'candidates': []}
+    # 候補抽出: 共通文字数の多い順に上位5件
+    scored = []
+    town_chars = set(town_clean)
+    for t in all_towns:
+        t_norm = _kana_norm(re.sub(r'^[大小]?字', '', t))
+        score = len(town_chars & set(t_norm))
+        if score > 0:
+            scored.append((score, t))
+    scored.sort(key=lambda x: -x[0])
+    candidates = [t for _, t in scored[:5]]
+    if not candidates:
+        candidates = all_towns[:5]
+    return None, {'status': 'town_not_matched', 'candidates': candidates}
 
 def lookup_postal_from_address(address):
+    """住所から郵便番号を逆引き
+
+    戻り値: (postal | None, fail_reason | None)
+    """
     if not isinstance(address, str) or not address.strip():
-        return None
+        return None, "住所が空"
     pref_m = PREF_PATTERN.match(address)
     if not pref_m:
-        return None
+        return None, "都道府県を判定できず"
     pref = pref_m.group(1)
     rest = address[len(pref):]
     city, town = _extract_city_and_town(rest)
-    if not city or not town:
-        return None
+    if not city:
+        return None, f"市区町村を抽出できず: 「{rest}」"
+    if not town:
+        return None, f"町名を抽出できず: 「{rest}」"
 
     # まず通常の検索
-    result = _heartrails_town_search(pref, city, town)
-    if result:
-        return result
+    postal, info = _heartrails_town_search(pref, city, town)
+    if postal:
+        return postal, None
 
     # フォールバック: 大字なしで town に「○○町/村」が含まれる場合、
     # city に町/村まで含めて再検索（例: 小城市, 牛津町柿通瀬 → 小城市牛津町, 柿通瀬）
@@ -202,9 +228,11 @@ def lookup_postal_from_address(address):
     if sub_m:
         city2 = city + sub_m.group(1)
         town2 = sub_m.group(2)
-        result = _heartrails_town_search(pref, city2, town2)
-        if result:
-            return result
+        postal2, info2 = _heartrails_town_search(pref, city2, town2)
+        if postal2:
+            return postal2, None
+        if info2.get('status') == 'town_not_matched' and info2.get('candidates'):
+            info = info2
 
     # フォールバック: 郡+旧町村の場合（合併済み自治体）
     # 例: city=神埼郡神埼町, town=本堀 → merged_city=神埼市, town=神埼町本堀
@@ -214,11 +242,19 @@ def lookup_postal_from_address(address):
             merged_city = gun_m.group(1) + '市'
             cho_son = gun_m.group(2)
             combined_town = cho_son + town
-            result = _heartrails_town_search(pref, merged_city, combined_town)
-            if result:
-                return result
+            postal3, info3 = _heartrails_town_search(pref, merged_city, combined_town)
+            if postal3:
+                return postal3, None
+            if info3.get('status') == 'town_not_matched' and info3.get('candidates'):
+                info = info3
 
-    return None
+    # 失敗理由を組み立て
+    if info.get('status') == 'city_not_found':
+        return None, f"市区町村「{pref}{city}」がデータベースに見つからず"
+    cands = info.get('candidates', [])
+    if cands:
+        return None, f"町名「{town}」が一致せず（候補: {', '.join(cands[:3])}）"
+    return None, f"町名「{town}」が一致せず"
 
 # ── 列マッピング ──────────────────────────────────────────────────────
 
@@ -289,6 +325,7 @@ def process(file_bytes, progress_callback=None, sheet_name=0):
                          'オーナー住所','物件名','物件住所']},
             '郵便番号_raw': get_val(row, col_map, '郵便番号'),
             '郵便番号': '',
+            '郵便番号失敗理由': '',
         }
         raw_rows.append(r)
 
@@ -337,13 +374,14 @@ def process(file_bytes, progress_callback=None, sheet_name=0):
 
         # 住所→郵便番号補完
         if r['オーナー住所'] and not is_valid_postal(r['郵便番号']):
-            filled_postal = lookup_postal_from_address(r['オーナー住所'])
+            filled_postal, fail_reason = lookup_postal_from_address(r['オーナー住所'])
             if filled_postal:
                 logs.append((no, f"オーナー住所から郵便番号を補完: 「{r['オーナー住所']}」→「{filled_postal}」"))
                 r['郵便番号'] = filled_postal
                 postal_fill_count += 1
             else:
-                logs.append((no, f"オーナー住所から郵便番号を逆引きできず"))
+                r['郵便番号失敗理由'] = fail_reason or ""
+                logs.append((no, f"オーナー住所から郵便番号を逆引きできず: {fail_reason}"))
             time.sleep(0.5)  # API レート制限対策
 
     notify("重複削除・連名統合を処理中...", 0.82)
@@ -411,7 +449,11 @@ def process(file_bytes, progress_callback=None, sheet_name=0):
         if not r['オーナー住所']:
             reasons.append("オーナー住所が未入力（補完不可）")
         if not is_valid_postal(r['郵便番号']):
-            reasons.append("郵便番号が未入力または形式不正（逆引き不可）")
+            fail = r.get('郵便番号失敗理由', '')
+            if fail:
+                reasons.append(f"郵便番号を逆引きできず: {fail}")
+            else:
+                reasons.append("郵便番号が未入力または形式不正（逆引き不可）")
         if reasons:
             r['エラー理由'] = ' / '.join(reasons)
             errors.append(r)
