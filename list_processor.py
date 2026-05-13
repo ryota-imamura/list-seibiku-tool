@@ -126,6 +126,13 @@ def lookup_prefecture_from_city(address):
             city = m.group(1)
             if city in _CITY_PREF_CACHE:
                 return _CITY_PREF_CACHE[city], city
+    # 郡+旧町村の場合（合併済み）: 郡名の前部分+市 を試みる
+    # 例: 神埼郡神埼町 → 神埼市
+    gun_m = re.match(r'^(.+)郡', address)
+    if gun_m:
+        merged_city = gun_m.group(1) + '市'
+        if merged_city in _CITY_PREF_CACHE:
+            return _CITY_PREF_CACHE[merged_city], merged_city
     return None, None
 
 def _extract_city_and_town(address):
@@ -198,6 +205,18 @@ def lookup_postal_from_address(address):
         result = _heartrails_town_search(pref, city2, town2)
         if result:
             return result
+
+    # フォールバック: 郡+旧町村の場合（合併済み自治体）
+    # 例: city=神埼郡神埼町, town=本堀 → merged_city=神埼市, town=神埼町本堀
+    if '郡' in city:
+        gun_m = re.match(r'^(.+)郡(.+)', city)
+        if gun_m:
+            merged_city = gun_m.group(1) + '市'
+            cho_son = gun_m.group(2)
+            combined_town = cho_son + town
+            result = _heartrails_town_search(pref, merged_city, combined_town)
+            if result:
+                return result
 
     return None
 
