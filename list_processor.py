@@ -97,6 +97,25 @@ _CITY_PREF_CACHE = {}  # {city_name: pref}
 _PREF_CITIES_CACHE = {}  # {pref: [city_name, ...]} 「市」のみ
 _TOWNS_CACHE = {}  # {(pref, city): [{'town': ..., 'postal': ...}, ...]}
 
+# 廃止された旧市 → 現存する新市（政令市の区など）のマッピング
+# 郡が付かないため郡フォールバックでは拾えない合併ケース
+_OBSOLETE_CITY_MAP = {
+    ('埼玉県', '浦和市'): ['さいたま市浦和区', 'さいたま市南区', 'さいたま市桜区', 'さいたま市緑区'],
+    ('埼玉県', '大宮市'): ['さいたま市大宮区', 'さいたま市北区', 'さいたま市西区', 'さいたま市見沼区'],
+    ('埼玉県', '与野市'): ['さいたま市中央区'],
+    ('埼玉県', '岩槻市'): ['さいたま市岩槻区'],
+    ('東京都', '秋川市'): ['あきる野市'],
+    ('東京都', '田無市'): ['西東京市'],
+    ('東京都', '保谷市'): ['西東京市'],
+    ('静岡県', '清水市'): ['静岡市清水区'],
+    ('静岡県', '蒲原町'): ['静岡市清水区'],
+    ('福岡県', '若宮町'): ['宮若市'],
+    ('熊本県', '富合町'): ['熊本市南区'],
+    ('新潟県', '新津市'): ['新潟市秋葉区'],
+    ('新潟県', '白根市'): ['新潟市南区'],
+    ('新潟県', '豊栄市'): ['新潟市北区'],
+}
+
 def _build_city_pref_cache():
     """全都道府県の市区町村→都道府県マッピングをHeartRailsから構築（初回のみ）"""
     global _CITY_PREF_CACHE, _PREF_CITIES_CACHE
@@ -177,8 +196,11 @@ def _extract_city_and_town(address):
             town_rest = town_rest[len(ku):]
     # 先頭の「大字/字」を除去
     town_rest = re.sub(r'^[大小]?字', '', town_rest)
-    # 丁目/番地/番/号 の番号部分以降を除去して町域名を取り出す
-    town = re.sub(r'[\d一二三四五六七八九十百千万]+(?:丁目|番地|番|号).*', '', town_rest).strip()
+    # 最初に登場するアスキー数字（番地）以降を全て除去
+    # 例: 「吹屋204-8」→「吹屋」、「福島799-7」→「福島」、「○○1丁目2番地」→「○○」
+    town = re.sub(r'\d.*', '', town_rest).strip()
+    # 漢数字+丁目/番地/番/号 のケースも除去（例: 「○○一丁目」）
+    town = re.sub(r'[一二三四五六七八九十百千万]+(?:丁目|番地|番|号).*', '', town).strip()
     # 中間に含まれる「大字/小字」も除去（例: 大和町大字尼寺 → 大和町尼寺）
     town = re.sub(r'[大小]字', '', town).strip()
     return city, town
@@ -239,6 +261,16 @@ def lookup_postal_from_address(address):
     postal, info = _heartrails_town_search(pref, city, town)
     if postal:
         return postal, None
+
+    # フォールバック: 廃止された旧市 → 新市（合併済み）
+    # 例: 浦和市 → さいたま市浦和区、秋川市 → あきる野市
+    if info.get('status') == 'city_not_found' and (pref, city) in _OBSOLETE_CITY_MAP:
+        for new_city in _OBSOLETE_CITY_MAP[(pref, city)]:
+            postal_o, info_o = _heartrails_town_search(pref, new_city, town)
+            if postal_o:
+                return postal_o, None
+            if info_o.get('status') == 'town_not_matched' and info_o.get('candidates'):
+                info = info_o
 
     # フォールバック: 大字なしで town に「○○町/村」が含まれる場合、
     # city に町/村まで含めて再検索（例: 小城市, 牛津町柿通瀬 → 小城市牛津町, 柿通瀬）
