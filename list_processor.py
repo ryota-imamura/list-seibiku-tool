@@ -94,10 +94,12 @@ _ALL_PREFS = [
     '熊本県','大分県','宮崎県','鹿児島県','沖縄県',
 ]
 _CITY_PREF_CACHE = {}  # {city_name: pref}
+_PREF_CITIES_CACHE = {}  # {pref: [city_name, ...]} 「市」のみ
+_TOWNS_CACHE = {}  # {(pref, city): [{'town': ..., 'postal': ...}, ...]}
 
 def _build_city_pref_cache():
     """全都道府県の市区町村→都道府県マッピングをHeartRailsから構築（初回のみ）"""
-    global _CITY_PREF_CACHE
+    global _CITY_PREF_CACHE, _PREF_CITIES_CACHE
     if _CITY_PREF_CACHE:
         return
     for pref in _ALL_PREFS:
@@ -105,6 +107,7 @@ def _build_city_pref_cache():
         data = _get_json(url)
         if not data:
             continue
+        cities_in_pref = []
         for loc in data.get('response', {}).get('location', []):
             city_full = loc.get('city', '')
             if not city_full:
@@ -114,7 +117,30 @@ def _build_city_pref_cache():
             m = re.match(r'^(.+市)', city_full)
             if m:
                 _CITY_PREF_CACHE.setdefault(m.group(1), pref)
+                if m.group(1) not in cities_in_pref:
+                    cities_in_pref.append(m.group(1))
+            elif city_full.endswith('市'):
+                if city_full not in cities_in_pref:
+                    cities_in_pref.append(city_full)
+        _PREF_CITIES_CACHE[pref] = cities_in_pref
         time.sleep(0.3)
+
+def _get_towns(pref, city):
+    """HeartRails getTowns 結果をキャッシュ付きで取得"""
+    key = (pref, city)
+    if key in _TOWNS_CACHE:
+        return _TOWNS_CACHE[key]
+    url = (
+        "https://geoapi.heartrails.com/api/json?method=getTowns"
+        f"&prefecture={urllib.parse.quote(pref)}"
+        f"&city={urllib.parse.quote(city)}"
+    )
+    data = _get_json(url)
+    locations = []
+    if data:
+        locations = data.get('response', {}).get('location', []) or []
+    _TOWNS_CACHE[key] = locations
+    return locations
 
 def lookup_prefecture_from_city(address):
     """住所の先頭から市区町村名を抽出して都道府県を逆引き"""
@@ -163,15 +189,7 @@ def _heartrails_town_search(pref, city, town):
     戻り値: (postal | None, info)
       info = {'status': 'ok'|'city_not_found'|'town_not_matched', 'candidates': [...]}
     """
-    url = (
-        "https://geoapi.heartrails.com/api/json?method=getTowns"
-        f"&prefecture={urllib.parse.quote(pref)}"
-        f"&city={urllib.parse.quote(city)}"
-    )
-    data = _get_json(url)
-    if not data:
-        return None, {'status': 'city_not_found', 'candidates': []}
-    locations = data.get('response', {}).get('location', [])
+    locations = _get_towns(pref, city)
     if not locations:
         return None, {'status': 'city_not_found', 'candidates': []}
     def _kana_norm(s):
@@ -235,18 +253,43 @@ def lookup_postal_from_address(address):
             info = info2
 
     # フォールバック: 郡+旧町村の場合（合併済み自治体）
-    # 例: city=神埼郡神埼町, town=本堀 → merged_city=神埼市, town=神埼町本堀
+    # 例1: 神埼郡神埼町 → 神埼市+神埼町○○
+    # 例2: 群馬郡榛名町 → 高崎市+榛名町○○（郡名と新市名が不一致）
+    # 例3: 勢多郡粕川村 → 前橋市+粕川町○○（村→町に表記変化することも）
     if '郡' in city:
         gun_m = re.match(r'^(.+)郡(.+)', city)
         if gun_m:
-            merged_city = gun_m.group(1) + '市'
+            gun_base = gun_m.group(1)
             cho_son = gun_m.group(2)
-            combined_town = cho_son + town
-            postal3, info3 = _heartrails_town_search(pref, merged_city, combined_town)
-            if postal3:
-                return postal3, None
-            if info3.get('status') == 'town_not_matched' and info3.get('candidates'):
-                info = info3
+            # cho_son の語尾を町/村両方試す
+            cho_son_variants = [cho_son]
+            if cho_son.endswith('村'):
+                cho_son_variants.append(cho_son[:-1] + '町')
+            elif cho_son.endswith('町'):
+                cho_son_variants.append(cho_son[:-1] + '村')
+            # 候補市: 郡名+市 を最優先、その後同県内の全市
+            tried = set()
+            candidate_cities = []
+            primary = gun_base + '市'
+            if primary in _CITY_PREF_CACHE:
+                candidate_cities.append(primary)
+            for c in _PREF_CITIES_CACHE.get(pref, []):
+                if c not in candidate_cities:
+                    candidate_cities.append(c)
+            ku_fallback_info = None
+            for cand_city in candidate_cities:
+                for cs in cho_son_variants:
+                    combined_town = cs + town
+                    if (pref, cand_city, combined_town) in tried:
+                        continue
+                    tried.add((pref, cand_city, combined_town))
+                    postal3, info3 = _heartrails_town_search(pref, cand_city, combined_town)
+                    if postal3:
+                        return postal3, None
+                    if info3.get('status') == 'town_not_matched' and info3.get('candidates') and ku_fallback_info is None:
+                        ku_fallback_info = (cand_city, info3)
+            if ku_fallback_info:
+                info = ku_fallback_info[1]
 
     # 失敗理由を組み立て
     if info.get('status') == 'city_not_found':
