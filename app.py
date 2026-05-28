@@ -1,7 +1,24 @@
 import streamlit as st
 import pandas as pd
+import subprocess
+import os
 from datetime import datetime
 from list_processor import process
+
+@st.cache_data(ttl=300)
+def _get_version():
+    """現在のGitコミットSHAと日時を返す。Streamlit Cloudでも動作する"""
+    try:
+        cwd = os.path.dirname(os.path.abspath(__file__))
+        sha = subprocess.check_output(
+            ['git', 'log', '-1', '--format=%h'], cwd=cwd,
+            stderr=subprocess.DEVNULL, timeout=2).decode().strip()
+        dt = subprocess.check_output(
+            ['git', 'log', '-1', '--format=%cd', '--date=format:%Y-%m-%d %H:%M'],
+            cwd=cwd, stderr=subprocess.DEVNULL, timeout=2).decode().strip()
+        return f"{sha} ({dt})"
+    except Exception:
+        return "unknown"
 
 st.set_page_config(
     page_title="リスト整備ツール",
@@ -210,6 +227,8 @@ else:
 # ── フッター ──────────────────────────────────────────────────────────
 st.divider()
 st.markdown(
-    '<div style="text-align:center; color:#aaa; font-size:0.8rem;">リスト整備ツール (β版)</div>',
+    f'<div style="text-align:center; color:#aaa; font-size:0.8rem;">'
+    f'リスト整備ツール (β版) ｜ ver. {_get_version()}'
+    f'</div>',
     unsafe_allow_html=True
 )
