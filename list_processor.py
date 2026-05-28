@@ -12,6 +12,17 @@ import pandas as pd
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
 
+def _get_app_version():
+    """現在のGitコミットSHAを返す。Streamlit Cloudでも動作"""
+    try:
+        import subprocess
+        cwd = os.path.dirname(os.path.abspath(__file__))
+        return subprocess.check_output(
+            ['git', 'log', '-1', '--format=%h (%cd)', '--date=format:%Y-%m-%d %H:%M'],
+            cwd=cwd, stderr=subprocess.DEVNULL, timeout=2).decode().strip()
+    except Exception:
+        return 'unknown'
+
 # ── posuto (日本郵便公式CSV内包DB) ──────────────────────────────────
 # posuto は約80MBのSQLite DBで、住所→郵便番号の完全な逆引きを可能にする
 _POSUTO_CONN = None
@@ -835,7 +846,12 @@ def process(file_bytes, progress_callback=None, sheet_name=0):
     ws3 = wb.create_sheet("整備ログ")
     for ci, h in enumerate(['行番号','処理内容'], 1):
         style_header(ws3.cell(row=1, column=ci, value=h), '375623')
-    for ri, (no, msg) in enumerate(logs, 2):
+    # 処理時のバージョン情報を1行目に記録（最新コードで処理されたか確認用）
+    version = _get_app_version()
+    from datetime import datetime as _dt
+    ws3.cell(row=2, column=1, value='[INFO]')
+    ws3.cell(row=2, column=2, value=f'処理バージョン: {version} ／ 処理日時: {_dt.now().strftime("%Y-%m-%d %H:%M:%S")}')
+    for ri, (no, msg) in enumerate(logs, 3):
         ws3.cell(row=ri, column=1, value=str(no))
         ws3.cell(row=ri, column=2, value=msg)
     set_col_widths(ws3, [12, 90])
