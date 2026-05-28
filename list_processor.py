@@ -44,6 +44,9 @@ def normalize_postal(s):
     digits = re.sub(r'\D', '', s)
     if len(digits) == 7:
         return f"{digits[:3]}-{digits[3:]}"
+    # Excelで数値型読込時の先頭ゼロ落ちを救済（6桁→0付与で7桁化）
+    if len(digits) == 6:
+        return f"0{digits[:2]}-{digits[2:]}"
     return None
 
 def is_valid_postal(s):
@@ -690,6 +693,29 @@ def process(file_bytes, progress_callback=None, sheet_name=0):
                 r['郵便番号失敗理由'] = fail_reason or ""
                 logs.append((no, f"オーナー住所から郵便番号を逆引きできず: {fail_reason}"))
             time.sleep(0.5)  # API レート制限対策
+
+        # フォールバック: 物件住所からの逆引き
+        # オーナー住所が空 or 逆引き失敗時に、物件住所から郵便番号を取得
+        # （オーナー＝物件所有者で自己居住している場合に有効）
+        if not is_valid_postal(r['郵便番号']) and r['物件住所']:
+            filled_postal, fail_reason2 = lookup_postal_from_address(r['物件住所'])
+            if filled_postal:
+                # オーナー住所がある場合、物件住所と一致するときのみ採用（誤適用防止）
+                if r['オーナー住所']:
+                    owner_norm = normalize_address_for_compare(r['オーナー住所'])
+                    prop_norm = normalize_address_for_compare(r['物件住所'])
+                    if owner_norm == prop_norm or (len(owner_norm) >= 10 and owner_norm[:10] == prop_norm[:10]):
+                        r['郵便番号'] = filled_postal
+                        r['郵便番号失敗理由'] = ''
+                        postal_fill_count += 1
+                        logs.append((no, f"物件住所から郵便番号を補完: 「{r['物件住所']}」→「{filled_postal}」（オーナー住所と一致）"))
+                else:
+                    # オーナー住所が空ならそのまま採用
+                    r['郵便番号'] = filled_postal
+                    r['郵便番号失敗理由'] = ''
+                    postal_fill_count += 1
+                    logs.append((no, f"物件住所から郵便番号を補完（オーナー住所空欄）: 「{r['物件住所']}」→「{filled_postal}」"))
+            time.sleep(0.3)
 
     notify("重複削除・連名統合を処理中...", 0.82)
 
