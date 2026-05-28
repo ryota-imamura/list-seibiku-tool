@@ -177,21 +177,51 @@ _PLACE_NAME_VARIANTS = {
 }
 
 def _build_city_pref_cache():
-    """全都道府県の市区町村→都道府県マッピングをHeartRailsから構築（初回のみ）"""
+    """全都道府県の市区町村→都道府県マッピングを構築（初回のみ）
+
+    posuto DB（日本郵便公式CSV）から先に構築し、HeartRailsで上書き補完する。
+    Streamlit Cloud等の環境で外部API（HeartRails）がブロック・タイムアウト
+    した場合でも、posuto単独で確実にキャッシュが構築される。
+    """
     global _CITY_PREF_CACHE, _PREF_CITIES_CACHE
     if _CITY_PREF_CACHE:
         return
+
+    # まず posuto DB から市区町村→都道府県マッピングを構築（オフライン・確実）
+    conn = _get_posuto_conn()
+    if conn is not None:
+        try:
+            for pref, city_full in conn.execute(
+                'SELECT DISTINCT prefecture, city FROM postal_data'):
+                if not pref or not city_full:
+                    continue
+                _CITY_PREF_CACHE[city_full] = pref
+                # 政令指定都市の親市も登録: 「北九州市小倉南区」→「北九州市」
+                m = re.match(r'^(.+市)', city_full)
+                if m:
+                    _CITY_PREF_CACHE.setdefault(m.group(1), pref)
+                    _PREF_CITIES_CACHE.setdefault(pref, [])
+                    if m.group(1) not in _PREF_CITIES_CACHE[pref]:
+                        _PREF_CITIES_CACHE[pref].append(m.group(1))
+                _PREF_CITIES_CACHE.setdefault(pref, [])
+                if city_full not in _PREF_CITIES_CACHE[pref]:
+                    _PREF_CITIES_CACHE[pref].append(city_full)
+        except Exception:
+            pass
+
+    # 続いて HeartRails で補完（呼び出し失敗時はposutoキャッシュで動作継続）
+    # 既存の posuto キャッシュは上書きせず追記のみ
     for pref in _ALL_PREFS:
         url = f"https://geoapi.heartrails.com/api/json?method=getCities&prefecture={urllib.parse.quote(pref)}"
         data = _get_json(url)
         if not data:
             continue
-        cities_in_pref = []
+        cities_in_pref = _PREF_CITIES_CACHE.setdefault(pref, [])
         for loc in data.get('response', {}).get('location', []):
             city_full = loc.get('city', '')
             if not city_full:
                 continue
-            _CITY_PREF_CACHE[city_full] = pref
+            _CITY_PREF_CACHE.setdefault(city_full, pref)
             # 政令指定都市: 「北九州市小倉南区」→「北九州市」も登録
             m = re.match(r'^(.+市)', city_full)
             if m:
@@ -201,7 +231,6 @@ def _build_city_pref_cache():
             # 政令市の区・町・村も検索候補に含める（合併済み市町村の郵便番号逆引き用）
             if city_full not in cities_in_pref:
                 cities_in_pref.append(city_full)
-        _PREF_CITIES_CACHE[pref] = cities_in_pref
         time.sleep(0.3)
 
 def _get_towns(pref, city):
