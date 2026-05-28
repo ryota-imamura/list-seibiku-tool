@@ -314,14 +314,16 @@ def _posuto_search(pref, city, town):
         nb_strip = re.sub(r'[町村]$', '', nb_n)
         if town_strip and nb_strip == town_strip:
             return _fmt(code), {'status': 'ok', 'candidates': []}
-    # 4. town の前方「○○町/村」までで切ったバリアントを試す
-    #    例: 「広田町富田」→「広田町」（富田は番地表記）
-    short_m = re.match(r'^(.+?[町村])', town_n)
-    if short_m and short_m.group(1) != town_n:
-        short_town = short_m.group(1)
-        for code, nb in rows:
-            if _norm(nb) == short_town:
-                return _fmt(code), {'status': 'ok', 'candidates': []}
+    # 4. town の前方「○○町」または「○○村」までで切ったバリアントを試す
+    #    例: 「広田町富田」→「広田町」、「吉村町図公甲」→「吉村町」
+    # 「町」を優先、見つからなければ「村」を試す
+    for end_ch in ('町', '村'):
+        short_m = re.match(rf'^(.+?{end_ch})', town_n)
+        if short_m and short_m.group(1) != town_n:
+            short_town = short_m.group(1)
+            for code, nb in rows:
+                if _norm(nb) == short_town:
+                    return _fmt(code), {'status': 'ok', 'candidates': []}
     # 5. 地名異体字テーブル（漢字→ひらがななど）を適用して再検索
     town_alt = town_n
     for k, v in _PLACE_NAME_VARIANTS.items():
