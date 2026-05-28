@@ -1,7 +1,9 @@
 import io
+import os
 import re
 import time
 import json
+import sqlite3
 import unicodedata
 import urllib.request
 import urllib.parse
@@ -9,6 +11,22 @@ import urllib.parse
 import pandas as pd
 import openpyxl
 from openpyxl.styles import Font, PatternFill, Alignment
+
+# ── posuto (日本郵便公式CSV内包DB) ──────────────────────────────────
+# posuto は約80MBのSQLite DBで、住所→郵便番号の完全な逆引きを可能にする
+_POSUTO_CONN = None
+
+def _get_posuto_conn():
+    global _POSUTO_CONN
+    if _POSUTO_CONN is not None:
+        return _POSUTO_CONN
+    try:
+        import posuto
+        db_path = os.path.join(os.path.dirname(posuto.__file__), 'postaldata.db')
+        _POSUTO_CONN = sqlite3.connect(db_path, check_same_thread=False)
+        return _POSUTO_CONN
+    except Exception:
+        return None
 
 # ── 正規化ユーティリティ ──────────────────────────────────────────────
 
@@ -94,7 +112,7 @@ _ALL_PREFS = [
     '熊本県','大分県','宮崎県','鹿児島県','沖縄県',
 ]
 _CITY_PREF_CACHE = {}  # {city_name: pref}
-_PREF_CITIES_CACHE = {}  # {pref: [city_name, ...]} 「市」のみ
+_PREF_CITIES_CACHE = {}  # {pref: [city_name, ...]} 市町村すべて（政令市の区含む）
 _TOWNS_CACHE = {}  # {(pref, city): [{'town': ..., 'postal': ...}, ...]}
 
 # 廃止された旧市 → 現存する新市（政令市の区など）のマッピング
@@ -114,6 +132,34 @@ _OBSOLETE_CITY_MAP = {
     ('新潟県', '新津市'): ['新潟市秋葉区'],
     ('新潟県', '白根市'): ['新潟市南区'],
     ('新潟県', '豊栄市'): ['新潟市北区'],
+    # 浜松市 2024年4月の区再編
+    ('静岡県', '浜松市東区'): ['浜松市中央区'],
+    ('静岡県', '浜松市西区'): ['浜松市中央区'],
+    ('静岡県', '浜松市南区'): ['浜松市中央区'],
+    ('静岡県', '浜松市北区'): ['浜松市中央区', '浜松市浜名区', '浜松市天竜区'],
+    ('静岡県', '浜松市浜北区'): ['浜松市浜名区'],
+}
+
+# 漢字異体字の正規化テーブル（地名に頻出する異体字）
+_KANJI_VARIANTS = str.maketrans({
+    '螢': '蛍', '蛍': '蛍',
+    '邊': '辺', '邉': '辺',
+    '齋': '斎', '齊': '斉',
+    '澤': '沢',
+    '濱': '浜',
+    '櫻': '桜',
+    '應': '応',
+    '會': '会',
+    '舊': '旧',
+    '寳': '宝', '寶': '宝',
+    '靑': '青',
+    '黑': '黒',
+    '槇': '槙',
+})
+
+# 地名特有の表記揺れ（漢字 ↔ ひらがな・別表記）
+_PLACE_NAME_VARIANTS = {
+    '大埆': '大そね',  # 高知県南国市の地名
 }
 
 def _build_city_pref_cache():
@@ -138,9 +184,9 @@ def _build_city_pref_cache():
                 _CITY_PREF_CACHE.setdefault(m.group(1), pref)
                 if m.group(1) not in cities_in_pref:
                     cities_in_pref.append(m.group(1))
-            elif city_full.endswith('市'):
-                if city_full not in cities_in_pref:
-                    cities_in_pref.append(city_full)
+            # 政令市の区・町・村も検索候補に含める（合併済み市町村の郵便番号逆引き用）
+            if city_full not in cities_in_pref:
+                cities_in_pref.append(city_full)
         _PREF_CITIES_CACHE[pref] = cities_in_pref
         time.sleep(0.3)
 
@@ -182,32 +228,145 @@ def lookup_prefecture_from_city(address):
 
 def _extract_city_and_town(address):
     """住所から都道府県除去済み文字列の市区町村と町域を抽出"""
-    city_m = re.match(r'^(.{2,10}?[市区町村])', address)
-    if not city_m:
+    # 「市/町/村/区」の出現位置を全て候補化し、_CITY_PREF_CACHE 一致を優先する
+    # これにより「四日市市」「津市一志町」などの曖昧ケースを正しく解釈
+    matches = [m for m in re.finditer(r'[市区町村]', address)]
+    if not matches:
         return None, None
-    city = city_m.group(1)
+    candidates = []
+    for m in matches:
+        end = m.end()
+        if end < 1 or end > 11:
+            continue
+        candidates.append(address[:end])
+    if not candidates:
+        return None, None
+    # キャッシュに存在するものを優先（複数あればより長いものを優先）
+    city = None
+    cached = [c for c in candidates if c in _CITY_PREF_CACHE]
+    if cached:
+        city = max(cached, key=len)
+    else:
+        # キャッシュ未構築時 or 未登録の市: 最短候補を採用
+        city = min(candidates, key=len)
     town_rest = address[len(city):]
-    # 政令指定都市: 市の後に「○○区」が続く場合は区まで含める
+    # 政令指定都市の区: city+区 がキャッシュ or 廃止旧区マップに存在する場合のみ拡張
+    # （姫路市飾磨区など中核市の地名「区」を誤って取り込まない）
     if city.endswith('市'):
         ku_m = re.match(r'^([^\d一二三四五六七八九十]+区)', town_rest)
         if ku_m:
-            ku = ku_m.group(1)
-            city = city + ku
-            town_rest = town_rest[len(ku):]
+            candidate = city + ku_m.group(1)
+            # キャッシュ または _OBSOLETE_CITY_MAP のキーに存在すれば区を含める
+            if candidate in _CITY_PREF_CACHE or \
+               any(k[1] == candidate for k in _OBSOLETE_CITY_MAP.keys()):
+                city = candidate
+                town_rest = town_rest[len(ku_m.group(1)):]
     # 先頭の「大字/字」を除去
     town_rest = re.sub(r'^[大小]?字', '', town_rest)
     # 最初に登場するアスキー数字（番地）以降を全て除去
     # 例: 「吹屋204-8」→「吹屋」、「福島799-7」→「福島」、「○○1丁目2番地」→「○○」
     town = re.sub(r'\d.*', '', town_rest).strip()
-    # 漢数字+丁目/番地/番/号 のケースも除去（例: 「○○一丁目」）
-    town = re.sub(r'[一二三四五六七八九十百千万]+(?:丁目|番地|番|号).*', '', town).strip()
+    # 漢数字+丁目/番地/号 のケースも除去（例: 「○○一丁目」）
+    # 「番」は除外: 「九番町」などの固有名詞町名を残すため
+    town = re.sub(r'[一二三四五六七八九十百千万]+(?:丁目|番地|号).*', '', town).strip()
+    # 「○丁目」末尾（数字なしの漢数字丁目）も除去
+    town = re.sub(r'[一二三四五六七八九十百千万]+丁目.*', '', town).strip()
     # 中間に含まれる「大字/小字」も除去（例: 大和町大字尼寺 → 大和町尼寺）
     town = re.sub(r'[大小]字', '', town).strip()
     return city, town
 
-def _heartrails_town_search(pref, city, town):
+def _posuto_search(pref, city, town):
+    """posuto DB で住所→郵便番号を逆引き
+
+    戻り値: (postal | None, info_dict)
+    info_dict は HeartRails 用と互換: {'status': 'ok'|'town_not_matched', 'candidates': [...]}
+    """
+    conn = _get_posuto_conn()
+    if conn is None:
+        return None, {'status': 'town_not_matched', 'candidates': []}
+    if not town:
+        return None, {'status': 'town_not_matched', 'candidates': []}
+
+    def _norm(s):
+        return s.replace('ヶ', 'ケ').replace('ヵ', 'カ').translate(_KANJI_VARIANTS)
+
+    def _fmt(code):
+        return f"{code[:3]}-{code[3:]}"
+
+    town_n = _norm(town)
+    town_strip = re.sub(r'[町村]$', '', town_n)
+
+    # 1. 完全一致
+    rows = conn.execute(
+        'SELECT code, neighborhood FROM postal_data WHERE prefecture=? AND city=?',
+        (pref, city or '')).fetchall()
+    for code, nb in rows:
+        if _norm(nb) == town_n:
+            return _fmt(code), {'status': 'ok', 'candidates': []}
+    # 2. 前方一致 (xx → xx町、xx → xx一丁目 など)
+    for code, nb in rows:
+        nb_n = _norm(nb)
+        if nb_n.startswith(town_n) or (town_strip and nb_n.startswith(town_strip)):
+            return _fmt(code), {'status': 'ok', 'candidates': []}
+    # 3. 逆方向の前方一致 (鼻毛石 ← 鼻毛石町 などは1と2でカバー、町除き完全一致)
+    for code, nb in rows:
+        nb_n = _norm(nb)
+        nb_strip = re.sub(r'[町村]$', '', nb_n)
+        if town_strip and nb_strip == town_strip:
+            return _fmt(code), {'status': 'ok', 'candidates': []}
+    # 4. town の前方「○○町/村」までで切ったバリアントを試す
+    #    例: 「広田町富田」→「広田町」（富田は番地表記）
+    short_m = re.match(r'^(.+?[町村])', town_n)
+    if short_m and short_m.group(1) != town_n:
+        short_town = short_m.group(1)
+        for code, nb in rows:
+            if _norm(nb) == short_town:
+                return _fmt(code), {'status': 'ok', 'candidates': []}
+    # 5. 地名異体字テーブル（漢字→ひらがななど）を適用して再検索
+    town_alt = town_n
+    for k, v in _PLACE_NAME_VARIANTS.items():
+        town_alt = town_alt.replace(k, v)
+    if town_alt != town_n:
+        for code, nb in rows:
+            if _norm(nb).startswith(town_alt):
+                return _fmt(code), {'status': 'ok', 'candidates': []}
+    candidates = [nb for _, nb in rows if town_strip and town_strip[:2] in nb][:5]
+    return None, {'status': 'town_not_matched', 'candidates': candidates}
+
+def _posuto_search_pref_wide(pref, town):
+    """都道府県内全体で町名を検索（合併済み市町村のフォールバック）
+
+    完全一致または前方一致でユニークなものを返す。
+    複数候補がある場合は None を返す（誤マッチ防止）。
+    """
+    conn = _get_posuto_conn()
+    if conn is None or not town:
+        return None
+    def _norm(s):
+        return s.replace('ヶ', 'ケ').replace('ヵ', 'カ').translate(_KANJI_VARIANTS)
+    def _fmt(code):
+        return f"{code[:3]}-{code[3:]}"
+    town_n = _norm(town)
+    town_strip = re.sub(r'[町村]$', '', town_n)
+    rows = conn.execute(
+        'SELECT code, city, neighborhood FROM postal_data WHERE prefecture=?',
+        (pref,)).fetchall()
+    # 完全一致を優先
+    exact = [(c, ct, nb) for c, ct, nb in rows if _norm(nb) == town_n]
+    if len(exact) == 1:
+        return _fmt(exact[0][0])
+    # 末尾町/村除き完全一致
+    if town_strip and town_strip != town_n:
+        strip_match = [(c, ct, nb) for c, ct, nb in rows
+                       if re.sub(r'[町村]$', '', _norm(nb)) == town_strip]
+        if len(strip_match) == 1:
+            return _fmt(strip_match[0][0])
+    return None
+
+def _heartrails_town_search(pref, city, town, strict=False):
     """HeartRails getTowns API で郵便番号を検索
 
+    strict=True のとき完全一致のみ（誤マッチ防止用）。
     戻り値: (postal | None, info)
       info = {'status': 'ok'|'city_not_found'|'town_not_matched', 'candidates': [...]}
     """
@@ -215,14 +374,36 @@ def _heartrails_town_search(pref, city, town):
     if not locations:
         return None, {'status': 'city_not_found', 'candidates': []}
     def _kana_norm(s):
-        return s.replace('ヶ', 'ケ').replace('ヵ', 'カ')
+        return s.replace('ヶ', 'ケ').replace('ヵ', 'カ').translate(_KANJI_VARIANTS)
     town_clean = _kana_norm(re.sub(r'^[大小]?字', '', town))
     if not town_clean:
         return None, {'status': 'town_not_matched', 'candidates': []}
     all_towns = [loc.get('town', '') for loc in locations if loc.get('town')]
+    # 末尾「町/村」を除いた正規化で一致判定（鼻毛石 ↔ 鼻毛石町 などをマッチ）
+    town_stripped = re.sub(r'[町村]$', '', town_clean)
     for loc in locations:
         loc_town = _kana_norm(re.sub(r'^[大小]?字', '', loc.get('town', '')))
-        if loc_town.startswith(town_clean) or town_clean.startswith(loc_town):
+        loc_stripped = re.sub(r'[町村]$', '', loc_town)
+        if strict:
+            # 厳格モード: 「町/村」除き完全一致のみ
+            if town_stripped and loc_stripped == town_stripped:
+                p = loc['postal']
+                return f"{p[:3]}-{p[3:]}", {'status': 'ok', 'candidates': []}
+            continue
+        # 通常マッチ: loc_town が town_clean の先頭部分（鼻毛石町←鼻毛石）
+        if loc_town.startswith(town_clean):
+            p = loc['postal']
+            return f"{p[:3]}-{p[3:]}", {'status': 'ok', 'candidates': []}
+        # 逆方向の包含マッチ: town_clean が loc_town で始まる
+        # ただし loc_town が短い「○○町/村/区」型のときは誤マッチ防止のため除外
+        # （沼田市の getTowns に「榛名町」だけがあり、群馬郡榛名町下里見が誤ヒットするのを回避）
+        if town_clean.startswith(loc_town):
+            if len(loc_town) <= 4 and loc_town.endswith(('町', '村', '区')):
+                pass  # 誤マッチ防止: スキップ
+            else:
+                p = loc['postal']
+                return f"{p[:3]}-{p[3:]}", {'status': 'ok', 'candidates': []}
+        if town_stripped and loc_stripped == town_stripped:
             p = loc['postal']
             return f"{p[:3]}-{p[3:]}", {'status': 'ok', 'candidates': []}
     # 候補抽出: 共通文字数の多い順に上位5件
@@ -257,7 +438,34 @@ def lookup_postal_from_address(address):
     if not town:
         return None, f"町名を抽出できず: 「{rest}」"
 
-    # まず通常の検索
+    # 最優先: posuto (日本郵便公式) で検索
+    postal, info = _posuto_search(pref, city, town)
+    if postal:
+        return postal, None
+
+    # posuto: 旧市 → 新市マッピング
+    if (pref, city) in _OBSOLETE_CITY_MAP:
+        for new_city in _OBSOLETE_CITY_MAP[(pref, city)]:
+            postal_o, info_o = _posuto_search(pref, new_city, town)
+            if postal_o:
+                return postal_o, None
+
+    # posuto: 県内ユニーク一致（合併済み市町村フォールバック）
+    if '郡' in (city or ''):
+        gun_m = re.match(r'^(.+)郡(.+)', city)
+        if gun_m:
+            cho_son = gun_m.group(2)
+            # cho_son+town と town 単独を試す
+            for t in [cho_son + town, town]:
+                postal_u = _posuto_search_pref_wide(pref, t)
+                if postal_u:
+                    return postal_u, None
+    else:
+        postal_u = _posuto_search_pref_wide(pref, town)
+        if postal_u:
+            return postal_u, None
+
+    # 続いて HeartRails で検索
     postal, info = _heartrails_town_search(pref, city, town)
     if postal:
         return postal, None
@@ -308,18 +516,40 @@ def lookup_postal_from_address(address):
             for c in _PREF_CITIES_CACHE.get(pref, []):
                 if c not in candidate_cities:
                     candidate_cities.append(c)
+            # 試す町名バリアント:
+            #   通常モード: cho_son+town（合併後も旧町村名を保持: 群馬町福島）
+            #   厳格モード: town 単独（合併後は旧町村名が消える: 子持村吹屋→渋川市吹屋）
+            #     ※ 厳格モードは完全一致のみで誤マッチ防止
+            non_strict_variants = [cs + town for cs in cho_son_variants]
             ku_fallback_info = None
+            # フェーズ1: cho_son+town を通常マッチで全市試す
             for cand_city in candidate_cities:
-                for cs in cho_son_variants:
-                    combined_town = cs + town
-                    if (pref, cand_city, combined_town) in tried:
+                for tv in non_strict_variants:
+                    if (pref, cand_city, tv, False) in tried:
                         continue
-                    tried.add((pref, cand_city, combined_town))
-                    postal3, info3 = _heartrails_town_search(pref, cand_city, combined_town)
+                    tried.add((pref, cand_city, tv, False))
+                    postal3, info3 = _heartrails_town_search(pref, cand_city, tv)
                     if postal3:
                         return postal3, None
                     if info3.get('status') == 'town_not_matched' and info3.get('candidates') and ku_fallback_info is None:
                         ku_fallback_info = (cand_city, info3)
+            # フェーズ2: town 単独を厳格マッチ
+            # 候補市を「同郡内の現存町村 or 郡名+市」に絞って誤マッチを防ぐ
+            # 例: 多野郡万場町 → 多野郡神流町（同郡）、利根郡月夜野町 → 利根郡みなかみ町（同郡）
+            gun_full = gun_base + '郡'
+            strict_candidates = []
+            for c in _PREF_CITIES_CACHE.get(pref, []):
+                if c == primary and c in _CITY_PREF_CACHE:
+                    strict_candidates.append(c)
+                elif c.startswith(gun_full):
+                    strict_candidates.append(c)
+            for cand_city in strict_candidates:
+                if (pref, cand_city, town, True) in tried:
+                    continue
+                tried.add((pref, cand_city, town, True))
+                postal3, info3 = _heartrails_town_search(pref, cand_city, town, strict=True)
+                if postal3:
+                    return postal3, None
             if ku_fallback_info:
                 info = ku_fallback_info[1]
 

@@ -1,6 +1,7 @@
 *.xlsx
 *.xls
 .ngrok_token
+.ngrok_domain
 __pycache__/
 *.pyc
 .DS_Store
