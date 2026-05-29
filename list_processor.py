@@ -606,12 +606,36 @@ def lookup_postal_from_address(address):
         return None, f"町名「{town}」が一致せず（候補: {', '.join(cands[:3])}）"
     return None, f"町名「{town}」が一致せず"
 
+# ── 出力フォーマット（変換後FMT.xlsx 準拠の33列）────────────────────────
+FMT_HEADERS = [
+    '発注日','発送日','反響状況','反響日','オーナー名',
+    '連名①','連名②','連名③','連名④','連名⑤',
+    '郵便番号','オーナー住所','物件名①','物件名②','○○周辺',
+    '物件住所①','物件住所②','地番','種別','備考',
+    '時候の挨拶','日付','個人/法人','面積','差出人',
+    '持ち分','階数','種別コード','予備1','予備2','予備3','予備4','予備5',
+]
+
+def _to_fmt_row(r):
+    """整備済み行データ r を変換後FMTの列名→値の辞書に変換"""
+    out = {h: '' for h in FMT_HEADERS}
+    out['オーナー名'] = r.get('オーナー名', '') or ''
+    for k in ['連名①','連名②','連名③','連名④','連名⑤']:
+        out[k] = r.get(k, '') or ''
+    out['郵便番号'] = r.get('郵便番号', '') or ''
+    out['オーナー住所'] = r.get('オーナー住所', '') or ''
+    out['物件名①'] = r.get('物件名', '') or ''
+    out['物件住所①'] = r.get('物件住所', '') or ''
+    out['地番'] = r.get('地番', '') or ''
+    out['備考'] = r.get('備考', '') or ''
+    return out
+
 # ── 列マッピング ──────────────────────────────────────────────────────
 
 def detect_columns(df):
     col_map = {k: None for k in
                ['オーナー名','連名①','連名②','連名③','連名④','連名⑤',
-                '郵便番号','オーナー住所','物件名','物件住所']}
+                '郵便番号','オーナー住所','物件名','物件住所','地番','備考']}
     alias_cols = []
     for col in df.columns:
         c = str(col)
@@ -623,10 +647,14 @@ def detect_columns(df):
             col_map['郵便番号'] = col
         elif any(k in c for k in ['居住地','オーナー住所','自宅','住所']) and '物件' not in c:
             col_map['オーナー住所'] = col
-        elif any(k in c for k in ['物件名','建物名','マンション名','物件名称']):
+        elif any(k in c for k in ['物件名','店舗名','建物名','マンション名','物件名称']):
             col_map['物件名'] = col
         elif any(k in c for k in ['物件所在地','物件住所']):
             col_map['物件住所'] = col
+        elif '地番' in c:
+            col_map['地番'] = col
+        elif '備考' in c:
+            col_map['備考'] = col
     for i, ac in enumerate(alias_cols[:5]):
         col_map[f'連名{["①","②","③","④","⑤"][i]}'] = ac
     return col_map
@@ -672,7 +700,7 @@ def process(file_bytes, progress_callback=None, sheet_name=0):
             'orig_no': orig_no,
             **{k: get_val(row, col_map, k)
                for k in ['オーナー名','連名①','連名②','連名③','連名④','連名⑤',
-                         'オーナー住所','物件名','物件住所']},
+                         'オーナー住所','物件名','物件住所','地番','備考']},
             '郵便番号_raw': get_val(row, col_map, '郵便番号'),
             '郵便番号': '',
             '郵便番号失敗理由': '',
@@ -846,29 +874,40 @@ def process(file_bytes, progress_callback=None, sheet_name=0):
         for i, w in enumerate(widths, 1):
             ws.column_dimensions[openpyxl.utils.get_column_letter(i)].width = w
 
-    # シート1: 整備済みリスト
+    # 変換後FMT 33列の列幅（ヘッダー順に対応）
+    fmt_widths = [
+        10,10,10,10,15,  # 発注日,発送日,反響状況,反響日,オーナー名
+        12,12,12,12,12,  # 連名①〜⑤
+        13,35,18,18,12,  # 郵便番号,オーナー住所,物件名①,物件名②,○○周辺
+        35,35,20,10,30,  # 物件住所①,物件住所②,地番,種別,備考
+        12,12,10,10,12,  # 時候の挨拶,日付,個人/法人,面積,差出人
+        10,8,12,8,8,8,8,8,  # 持ち分,階数,種別コード,予備1〜5
+    ]
+
+    # シート1: 整備済みリスト（変換後FMT.xlsx 準拠の33列）
     ws1 = wb.active
     ws1.title = "整備済みリスト"
-    h1 = ['No','オーナー名','連名①','連名②','連名③','連名④','連名⑤','郵便番号','オーナー住所','物件名','物件住所']
-    for ci, h in enumerate(h1, 1):
+    for ci, h in enumerate(FMT_HEADERS, 1):
         style_header(ws1.cell(row=1, column=ci, value=h), '1F4E79')
     for ri, r in enumerate(ok_rows, 2):
-        ws1.cell(row=ri, column=1, value=ri-1)
-        for ci, k in enumerate(h1[1:], 2):
-            ws1.cell(row=ri, column=ci, value=r.get(k,'') or '')
-    set_col_widths(ws1, [5,15,12,12,12,12,12,13,35,18,35])
+        fmt = _to_fmt_row(r)
+        for ci, h in enumerate(FMT_HEADERS, 1):
+            ws1.cell(row=ri, column=ci, value=fmt[h])
+    set_col_widths(ws1, fmt_widths)
     ws1.row_dimensions[1].height = 20
 
-    # シート2: エラーリスト
+    # シート2: エラーリスト（元行番号 + 変換後FMT33列 + エラー理由）
     ws2 = wb.create_sheet("エラーリスト")
-    h2 = ['元行番号','オーナー名','連名①','連名②','連名③','連名④','連名⑤','郵便番号','オーナー住所','物件名','物件住所','エラー理由']
+    h2 = ['元行番号'] + FMT_HEADERS + ['エラー理由']
     for ci, h in enumerate(h2, 1):
         style_header(ws2.cell(row=1, column=ci, value=h), 'C00000')
     for ri, r in enumerate(errors, 2):
+        fmt = _to_fmt_row(r)
         ws2.cell(row=ri, column=1, value=r.get('orig_no',''))
-        for ci, k in enumerate(h2[1:], 2):
-            ws2.cell(row=ri, column=ci, value=r.get(k,'') or '')
-    set_col_widths(ws2, [10,15,12,12,12,12,12,13,35,18,35,45])
+        for ci, h in enumerate(FMT_HEADERS, 2):
+            ws2.cell(row=ri, column=ci, value=fmt[h])
+        ws2.cell(row=ri, column=len(h2), value=r.get('エラー理由','') or '')
+    set_col_widths(ws2, [10] + fmt_widths + [45])
     ws2.row_dimensions[1].height = 20
 
     # シート3: 整備ログ
