@@ -692,6 +692,8 @@ def process(file_bytes, progress_callback=None, sheet_name=0):
     logs, errors, raw_rows = [], [], []
     seen_keys = set()
     dup_count = addr_fill_count = postal_fill_count = merge_count = garbled_count = 0
+    # 提供リストの各行が最終的にどうなったかの追跡 {orig_no: (区分, 詳細)}
+    status_by_orig = {}
 
     # ── 行データ抽出 ──
     for idx, row in df_raw.iterrows():
@@ -793,6 +795,7 @@ def process(file_bytes, progress_callback=None, sheet_name=0):
         key = (r['オーナー名'], normalize_address_for_compare(r['オーナー住所']), r['郵便番号'])
         if key in seen_keys and r['オーナー名']:
             logs.append((r['orig_no'], f"重複行として除外 (オーナー名: {r['オーナー名']}, 住所: {r['オーナー住所']})"))
+            status_by_orig[r['orig_no']] = ('重複削除', 'オーナー名・住所・郵便番号が他行と重複')
             dup_count += 1
             continue
         seen_keys.add(key)
@@ -821,6 +824,10 @@ def process(file_bytes, progress_callback=None, sheet_name=0):
                     if g[k]:
                         all_names.append(g[k])
                 merged_ids.add(id(g))
+                # 統合先（group[0]）以外は「連名統合」として記録
+                if id(g) != id(group[0]):
+                    status_by_orig[g['orig_no']] = (
+                        '連名統合', f"{group[0]['orig_no']}行目に統合（{group[0]['オーナー名']}）")
             merged = dict(r)
             merged['オーナー名'] = all_names[0] if all_names else ""
             for i, ak in enumerate(['連名①','連名②','連名③','連名④','連名⑤']):
@@ -859,8 +866,12 @@ def process(file_bytes, progress_callback=None, sheet_name=0):
             r['エラー理由'] = ' / '.join(reasons)
             errors.append(r)
             logs.append((r['orig_no'], f"エラーリストへ: {r['エラー理由']}"))
+            status_by_orig[r['orig_no']] = ('エラー（送付不可）', r['エラー理由'])
         else:
             ok_rows.append(r)
+            merged_note = '連名統合済み' if any(r.get(k) for k in
+                ['連名①','連名②','連名③','連名④','連名⑤']) else ''
+            status_by_orig[r['orig_no']] = ('採用', merged_note)
 
     # ── Excel出力 ──
     wb = openpyxl.Workbook()
@@ -910,7 +921,35 @@ def process(file_bytes, progress_callback=None, sheet_name=0):
     set_col_widths(ws2, [10] + fmt_widths + [45])
     ws2.row_dimensions[1].height = 20
 
-    # シート3: 整備ログ
+    # シート3: 提供リスト対応表（提供リストの各行が最終的にどうなったかを追跡）
+    ws_t = wb.create_sheet("提供リスト対応表")
+    orig_cols = [str(c) for c in df_raw.columns]
+    h_t = orig_cols + ['整備状況', '処理詳細']
+    for ci, h in enumerate(h_t, 1):
+        style_header(ws_t.cell(row=1, column=ci, value=h), '7030A0')
+    status_fills = {
+        '採用': PatternFill('solid', start_color='E2EFDA'),
+        '連名統合': PatternFill('solid', start_color='FFF2CC'),
+        '重複削除': PatternFill('solid', start_color='D9D9D9'),
+        'エラー（送付不可）': PatternFill('solid', start_color='FCE4D6'),
+    }
+    n_orig = len(orig_cols)
+    for ri, (idx, row) in enumerate(df_raw.iterrows(), 2):
+        orig_no = idx + 2
+        for ci, c in enumerate(df_raw.columns, 1):
+            v = row[c]
+            ws_t.cell(row=ri, column=ci, value='' if pd.isna(v) else v)
+        status, detail = status_by_orig.get(orig_no, ('未処理', ''))
+        sc = ws_t.cell(row=ri, column=n_orig + 1, value=status)
+        ws_t.cell(row=ri, column=n_orig + 2, value=detail)
+        fill = status_fills.get(status)
+        if fill:
+            for ci in range(1, n_orig + 3):
+                ws_t.cell(row=ri, column=ci).fill = fill
+    set_col_widths(ws_t, [18] * n_orig + [16, 40])
+    ws_t.row_dimensions[1].height = 20
+
+    # シート4: 整備ログ
     ws3 = wb.create_sheet("整備ログ")
     for ci, h in enumerate(['行番号','処理内容'], 1):
         style_header(ws3.cell(row=1, column=ci, value=h), '375623')
