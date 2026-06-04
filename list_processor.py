@@ -4,6 +4,7 @@ import re
 import time
 import json
 import sqlite3
+import datetime
 import unicodedata
 import urllib.request
 import urllib.parse
@@ -657,6 +658,16 @@ def detect_columns(df):
             col_map['備考'] = col
     for i, ac in enumerate(alias_cols[:5]):
         col_map[f'連名{["①","②","③","④","⑤"][i]}'] = ac
+    # 地番がヘッダー名で拾えなかった場合の補完:
+    # 提供リストでは地番列が「物件住所」の直後に並ぶ。ヘッダーが空（Unnamed）の
+    # 列はキーワード判定で捨てられるため、物件住所の右隣がヘッダー空なら地番とみなす。
+    cols = list(df.columns)
+    if col_map['地番'] is None and col_map['物件住所'] in cols:
+        idx = cols.index(col_map['物件住所'])
+        if idx + 1 < len(cols):
+            nxt = cols[idx + 1]
+            if str(nxt).startswith('Unnamed') and nxt not in col_map.values():
+                col_map['地番'] = nxt
     return col_map
 
 def get_val(row, col_map, key):
@@ -666,6 +677,9 @@ def get_val(row, col_map, key):
     v = row.get(col, "")
     if pd.isna(v):
         return ""
+    # Excelが日付に自動変換した地番等（例: 「3-22」→2001-03-22）を文字列化
+    if isinstance(v, (pd.Timestamp, datetime.datetime, datetime.date)):
+        return v.strftime('%Y-%m-%d')
     return to_halfwidth(str(v)).strip()
 
 # ── メイン処理 ────────────────────────────────────────────────────────
