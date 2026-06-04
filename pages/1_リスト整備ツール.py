@@ -99,6 +99,32 @@ if uploaded:
     st.caption(f"ファイル名: `{uploaded.name}`　シート: `{selected_sheet}`　/ プレビュー（先頭5行）")
     st.dataframe(df_preview, use_container_width=True)
 
+    # ── 空ヘッダー列の確認 ──────────────────────────────────────────────
+    from list_processor import detect_columns
+    df_full = pd.read_excel(uploaded, sheet_name=selected_sheet, header=0)
+    uploaded.seek(0)
+    cmap = detect_columns(df_full)
+    col_to_field = {c: f for f, c in cmap.items() if c is not None}
+    field_options = ['使わない', '地番', '物件名', '物件住所', 'オーナー名', 'オーナー住所',
+                     '郵便番号', '連名①', '連名②', '連名③', '連名④', '連名⑤', '備考']
+    unnamed_cols = [c for c in df_full.columns
+                    if str(c).startswith('Unnamed') and df_full[c].notna().any()]
+    manual_map = {}
+    if unnamed_cols:
+        st.divider()
+        st.subheader("⚠️ 列名（ヘッダー）が空の列の確認")
+        st.caption("ヘッダーが空の列が見つかりました。それぞれどの項目に入れるか確認してください。"
+                   "（自動推測がある場合は初期選択済みです）")
+        for c in unnamed_cols:
+            samples = [str(v) for v in df_full[c].dropna().head(3).tolist()]
+            default_field = col_to_field.get(c, '使わない')
+            default_idx = field_options.index(default_field) if default_field in field_options else 0
+            sel = st.selectbox(
+                f"空ヘッダー列（例: {', '.join(samples) or '（データ例なし）'}）の割り当て",
+                field_options, index=default_idx, key=f"map_{selected_sheet}_{c}",
+            )
+            manual_map[c] = sel
+
     st.divider()
     st.subheader("② 整備を実行")
 
@@ -114,7 +140,7 @@ if uploaded:
                 progress_bar.progress(min(progress, 1.0))
 
         try:
-            excel_bytes, summary, error_list = process(file_bytes, on_progress, sheet_name=selected_sheet)
+            excel_bytes, summary, error_list = process(file_bytes, on_progress, sheet_name=selected_sheet, manual_map=manual_map)
         except Exception as e:
             st.error(f"処理中にエラーが発生しました: {e}")
             st.stop()

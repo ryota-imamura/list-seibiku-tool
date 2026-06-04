@@ -684,11 +684,12 @@ def get_val(row, col_map, key):
 
 # ── メイン処理 ────────────────────────────────────────────────────────
 
-def process(file_bytes, progress_callback=None, sheet_name=0):
+def process(file_bytes, progress_callback=None, sheet_name=0, manual_map=None):
     """
     file_bytes: bytes (Excelファイル)
     progress_callback: callable(message: str, progress: float) | None  進捗通知用
     sheet_name: int | str  読み込むシート（デフォルト=先頭シート）
+    manual_map: dict {列名: 割当項目 | '使わない'} | None  空ヘッダー列等の手動上書き
     戻り値: (excel_bytes, summary_dict, error_list)
     """
     def notify(msg, progress=None):
@@ -697,6 +698,17 @@ def process(file_bytes, progress_callback=None, sheet_name=0):
 
     df_raw = pd.read_excel(io.BytesIO(file_bytes), header=0, sheet_name=sheet_name)
     col_map = detect_columns(df_raw)
+
+    # 手動マッピングで上書き（空ヘッダー列の割当をユーザーが確定したケース）
+    if manual_map:
+        for col, field in manual_map.items():
+            if field in (None, '', '使わない'):
+                # 自動割当されていた列を解除
+                for k, v in list(col_map.items()):
+                    if v == col:
+                        col_map[k] = None
+            elif field in col_map:
+                col_map[field] = col
 
     # 空行除去：オーナー名・オーナー住所・郵便番号がすべて空の行はスキップ
     key_cols = [c for c in [col_map.get('オーナー名'), col_map.get('オーナー住所'), col_map.get('郵便番号')] if c]
