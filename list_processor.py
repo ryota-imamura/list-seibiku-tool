@@ -698,6 +698,10 @@ FMT_HEADERS = [
     '持ち分','階数','種別コード','予備1','予備2','予備3','予備4','予備5',
 ]
 
+def _fw_hyphen(s):
+    """出力用: 半角ハイフンを全角「－」に変換（住所・地番の印字用）"""
+    return s.replace('-', '－') if isinstance(s, str) else s
+
 def _to_fmt_row(r):
     """整備済み行データ r を変換後FMTの列名→値の辞書に変換"""
     out = {h: '' for h in FMT_HEADERS}
@@ -705,10 +709,10 @@ def _to_fmt_row(r):
     for k in ['連名①','連名②','連名③','連名④','連名⑤']:
         out[k] = r.get(k, '') or ''
     out['郵便番号'] = r.get('郵便番号', '') or ''
-    out['オーナー住所'] = r.get('オーナー住所', '') or ''
+    out['オーナー住所'] = _fw_hyphen(r.get('オーナー住所', '') or '')
     out['物件名①'] = r.get('物件名', '') or ''
-    out['物件住所①'] = r.get('物件住所', '') or ''
-    out['地番'] = r.get('地番', '') or ''
+    out['物件住所①'] = _fw_hyphen(r.get('物件住所', '') or '')
+    out['地番'] = _fw_hyphen(r.get('地番', '') or '')
     out['備考'] = r.get('備考', '') or ''
     return out
 
