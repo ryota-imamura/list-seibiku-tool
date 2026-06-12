@@ -47,6 +47,18 @@ def to_halfwidth(s):
         return s
     return unicodedata.normalize('NFKC', s).strip()
 
+# ハイフンに統一するダッシュ類（長音符「ー」はカタカナ語を壊すため文脈判定で処理）
+_DASH_CHARS = '‐‑‒–—―−﹣－─━'
+
+def normalize_dashes(s):
+    if not isinstance(s, str):
+        return s
+    for ch in _DASH_CHARS:
+        s = s.replace(ch, '-')
+    # 長音符は数字に隣接する場合のみハイフン化（例: 1ー2ー3 → 1-2-3）
+    s = re.sub(r'(?<=\d)\s*[ーｰ]|[ーｰ]\s*(?=\d)', '-', s)
+    return s
+
 def normalize_postal(s):
     if not isinstance(s, str):
         s = str(s) if pd.notna(s) else ""
@@ -80,7 +92,7 @@ def has_prefecture(address):
 def normalize_address_for_compare(addr):
     if not addr:
         return ""
-    s = to_halfwidth(addr)
+    s = normalize_dashes(to_halfwidth(addr))
     s = re.sub(r'(\d+)丁目', r'\1-', s)
     s = re.sub(r'(\d+)番地', r'\1-', s)
     s = re.sub(r'(\d+)番',  r'\1-', s)
@@ -680,7 +692,7 @@ def get_val(row, col_map, key):
     # Excelが日付に自動変換した地番等（例: 「3-22」→2001-03-22）を文字列化
     if isinstance(v, (pd.Timestamp, datetime.datetime, datetime.date)):
         return v.strftime('%Y-%m-%d')
-    return to_halfwidth(str(v)).strip()
+    return normalize_dashes(to_halfwidth(str(v))).strip()
 
 # ── メイン処理 ────────────────────────────────────────────────────────
 
