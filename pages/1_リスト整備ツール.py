@@ -162,12 +162,14 @@ if uploaded:
                       delta_color="inverse",
                       help="住所不明・名前なし等でDM送付不可の件数")
 
-        c1, c2, c3, c4, c5 = st.columns(5)
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
         c1.metric("🗑️ 重複削除",    f"{summary['重複削除件数']} 件")
         c2.metric("🏠 住所補完",    f"{summary['住所補完件数']} 件")
-        c3.metric("📮 郵便番号補完", f"{summary['郵便番号補完件数']} 件")
+        c3.metric("📮 郵便番号補完", f"{summary['郵便番号補完件数'] + summary.get('郵便番号修正件数', 0)} 件")
         c4.metric("👥 連名統合",    f"{summary['連名統合件数']} 件")
         c5.metric("🔤 文字化け",    f"{summary['文字化け検出件数']} 件")
+        c6.metric("⚠️ 要確認",     f"{summary.get('要確認件数', 0)} 件",
+                  help="番地なし・郵便番号と住所の地域不一致など、発送前に目視確認を推奨する行（提供リスト対応表シートで黄色表示）")
 
         if error_list:
             st.divider()
@@ -182,14 +184,14 @@ if uploaded:
         now = datetime.now().strftime("%Y%m%d_%H%M")
         dl_name = f"整備済みリスト_{now}.xlsx"
         st.download_button(
-            label="📥 Excelをダウンロード（整備済み・エラー・ログの3シート）",
+            label="📥 Excelをダウンロード（整備済み・エラー・対応表・ログの4シート）",
             data=excel_bytes,
             file_name=dl_name,
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             type="primary",
             use_container_width=True,
         )
-        st.caption(f"出力ファイル: `{dl_name}`　（整備済みリスト / エラーリスト / 整備ログ の3シート構成）")
+        st.caption(f"出力ファイル: `{dl_name}`　（整備済みリスト / エラーリスト / 提供リスト対応表 / 整備ログ の4シート構成）")
 else:
     st.info("👆 Excelファイル（.xlsx）をアップロードしてください")
 

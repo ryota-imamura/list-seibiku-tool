@@ -101,6 +101,54 @@ def normalize_address_for_compare(addr):
     s = re.sub(r'-{2,}', '-', s)
     return s.strip()
 
+# 人名に頻出する異体字（NFKCでは統一されないもの）
+_NAME_KANJI_VARIANTS = str.maketrans({
+    '髙': '高', '﨑': '崎', '嵜': '崎', '邊': '辺', '邉': '辺',
+    '齋': '斎', '齊': '斉', '澤': '沢', '濱': '浜', '濵': '浜',
+    '櫻': '桜', '會': '会', '國': '国', '德': '徳', '惠': '恵',
+    '榮': '栄', '淸': '清', '眞': '真', '靑': '青', '黑': '黒',
+    '壽': '寿', '藏': '蔵', '嶋': '島', '槇': '槙', '瀨': '瀬',
+    '萬': '万', '與': '与', '彌': '弥', '廣': '広', '鹽': '塩',
+})
+
+def normalize_name_for_compare(name):
+    """重複判定・名寄せ用の人名キー（スペース除去＋異体字統一）"""
+    if not name:
+        return ""
+    s = to_halfwidth(name)
+    s = re.sub(r'\s+', '', s)
+    return s.translate(_NAME_KANJI_VARIANTS)
+
+_KANJI_DIGITS = {'〇': 0, '一': 1, '二': 2, '三': 3, '四': 4,
+                 '五': 5, '六': 6, '七': 7, '八': 8, '九': 9}
+
+def _kanji_num_to_int(s):
+    if '十' in s:
+        head, _, tail = s.partition('十')
+        return (_KANJI_DIGITS.get(head, 1) if head else 1) * 10 + \
+               (_KANJI_DIGITS.get(tail, 0) if tail else 0)
+    n = 0
+    for ch in s:
+        n = n * 10 + _KANJI_DIGITS.get(ch, 0)
+    return n
+
+def normalize_banchi(addr):
+    """番地表記を出力用に統一: 「1丁目2番地3号」→「1-2-3」
+
+    「一番町」「九番町」等の固有名詞町名や「101号室」「3号棟」は変換しない。
+    """
+    if not isinstance(addr, str) or not addr:
+        return addr
+    s = re.sub(r'([〇一二三四五六七八九十]+)丁目',
+               lambda m: f"{_kanji_num_to_int(m.group(1))}丁目", addr)
+    s = re.sub(r'(\d+)丁目(?=\d)', r'\1-', s)
+    s = re.sub(r'(\d+)番地?の?(?=\d)', r'\1-', s)
+    s = re.sub(r'(\d+)番地(?!\d)', r'\1', s)
+    s = re.sub(r'(\d+)番(?=$|\s)', r'\1', s)
+    s = re.sub(r'(\d+)号(?![棟室館\d])', r'\1', s)
+    s = re.sub(r'-{2,}', '-', s)
+    return s
+
 # ── API呼び出し ───────────────────────────────────────────────────────
 
 def _get_json(url, timeout=5):
@@ -127,6 +175,27 @@ def lookup_prefecture_from_postal(postal):
     if data and data.get('results'):
         return data['results'][0].get('address1')
     return None
+
+def _postal_location(postal):
+    """郵便番号→(都道府県, 市区町村)。posuto優先（オフライン）、なければzipcloud"""
+    if not is_valid_postal(postal):
+        return None, None
+    code = postal.replace('-', '')
+    conn = _get_posuto_conn()
+    if conn is not None:
+        try:
+            row = conn.execute(
+                'SELECT prefecture, city FROM postal_data WHERE code=? LIMIT 1',
+                (code,)).fetchone()
+            if row:
+                return row[0], row[1]
+        except Exception:
+            pass
+    data = _get_json(f"https://zipcloud.ibsnet.co.jp/api/search?zipcode={code}")
+    if data and data.get('results'):
+        res = data['results'][0]
+        return res.get('address1'), res.get('address2')
+    return None, None
 
 # 都道府県リスト
 _ALL_PREFS = [
@@ -730,6 +799,7 @@ def process(file_bytes, progress_callback=None, sheet_name=0, manual_map=None):
     logs, errors, raw_rows = [], [], []
     seen_keys = set()
     dup_count = addr_fill_count = postal_fill_count = merge_count = garbled_count = 0
+    postal_fix_count = warn_count = 0
     # 提供リストの各行が最終的にどうなったかの追跡 {orig_no: (区分, 詳細)}
     status_by_orig = {}
 
@@ -744,7 +814,13 @@ def process(file_bytes, progress_callback=None, sheet_name=0, manual_map=None):
             '郵便番号_raw': get_val(row, col_map, '郵便番号'),
             '郵便番号': '',
             '郵便番号失敗理由': '',
+            '警告': [],
         }
+        for k in ('オーナー住所', '物件住所', '地番'):
+            b = normalize_banchi(r[k])
+            if b != r[k]:
+                logs.append((orig_no, f"番地表記を統一: 「{r[k]}」→「{b}」"))
+                r[k] = b
         raw_rows.append(r)
 
     total = len(raw_rows)
@@ -825,12 +901,38 @@ def process(file_bytes, progress_callback=None, sheet_name=0, manual_map=None):
                     logs.append((no, f"物件住所から郵便番号を補完（オーナー住所空欄）: 「{r['物件住所']}」→「{filled_postal}」"))
             time.sleep(0.3)
 
+        # 郵便番号と住所の整合チェック（形式は正しいが別地域の郵便番号を検出・修正）
+        if is_valid_postal(r['郵便番号']) and has_prefecture(r['オーナー住所']):
+            p_pref, p_city = _postal_location(r['郵便番号'])
+            a_pref = PREF_PATTERN.match(r['オーナー住所']).group(1)
+            mismatch = ''
+            if p_pref and p_pref != a_pref:
+                mismatch = f"郵便番号の地域は{p_pref}{p_city or ''}、住所は{a_pref}"
+            elif p_pref and p_city:
+                a_city, _ = _extract_city_and_town(r['オーナー住所'][len(a_pref):])
+                if a_city and not (p_city.startswith(a_city) or a_city.startswith(p_city)):
+                    # 合併前の旧市町村名での誤検出を防ぐため、現存する市区町村のみ比較
+                    _build_city_pref_cache()
+                    if a_city in _CITY_PREF_CACHE:
+                        mismatch = f"郵便番号の地域は{p_pref}{p_city}、住所は{a_pref}{a_city}"
+            if mismatch:
+                fixed, _fail = lookup_postal_from_address(r['オーナー住所'])
+                if fixed and fixed != r['郵便番号']:
+                    logs.append((no, f"郵便番号が住所と不一致のため修正（{mismatch}）: 「{r['郵便番号']}」→「{fixed}」"))
+                    r['郵便番号'] = fixed
+                    postal_fix_count += 1
+                elif not fixed:
+                    r['警告'].append(f"郵便番号と住所の地域が不一致（{mismatch}）")
+                    logs.append((no, f"郵便番号と住所の地域が不一致だが住所からの逆引きも不可 → 要確認: {mismatch}"))
+                time.sleep(0.3)
+
     notify("重複削除・連名統合を処理中...", 0.82)
 
     # ── 重複削除 ──
     dedup_rows = []
     for r in raw_rows:
-        key = (r['オーナー名'], normalize_address_for_compare(r['オーナー住所']), r['郵便番号'])
+        key = (normalize_name_for_compare(r['オーナー名']),
+               normalize_address_for_compare(r['オーナー住所']), r['郵便番号'])
         if key in seen_keys and r['オーナー名']:
             logs.append((r['orig_no'], f"重複行として除外 (オーナー名: {r['オーナー名']}, 住所: {r['オーナー住所']})"))
             status_by_orig[r['orig_no']] = ('重複削除', 'オーナー名・住所・郵便番号が他行と重複')
@@ -854,13 +956,18 @@ def process(file_bytes, progress_callback=None, sheet_name=0, manual_map=None):
         norm_key = normalize_address_for_compare(r['オーナー住所']) if r['オーナー住所'] else ""
         group = addr_groups.get(norm_key, [])
         if r['オーナー住所'] and len(group) > 1 and id(group[0]) == id(r):
-            all_names = []
+            all_names, seen_name_keys = [], set()
+            def _add_name(name):
+                nk = normalize_name_for_compare(name)
+                if nk and nk not in seen_name_keys:
+                    seen_name_keys.add(nk)
+                    all_names.append(name)
             for g in group:
                 if g['オーナー名']:
-                    all_names.append(g['オーナー名'])
+                    _add_name(g['オーナー名'])
                 for k in ['連名①','連名②','連名③','連名④','連名⑤']:
                     if g[k]:
-                        all_names.append(g[k])
+                        _add_name(g[k])
                 merged_ids.add(id(g))
                 # 統合先（group[0]）以外は「連名統合」として記録
                 if id(g) != id(group[0]):
@@ -884,6 +991,9 @@ def process(file_bytes, progress_callback=None, sheet_name=0, manual_map=None):
     # ── エラー判定 ──
     ok_rows = []
     for r in final_rows:
+        # 番地のない住所は不着リスクが高いため警告（エラーにはしない）
+        if r['オーナー住所'] and not re.search(r'\d', r['オーナー住所']):
+            r['警告'].append('番地なし（不着リスク）')
         reasons = []
         for f in [r['オーナー名'], r['オーナー住所'], r['物件名'], r['物件住所']]:
             if is_garbled(f):
@@ -907,9 +1017,17 @@ def process(file_bytes, progress_callback=None, sheet_name=0, manual_map=None):
             status_by_orig[r['orig_no']] = ('エラー（送付不可）', r['エラー理由'])
         else:
             ok_rows.append(r)
-            merged_note = '連名統合済み' if any(r.get(k) for k in
-                ['連名①','連名②','連名③','連名④','連名⑤']) else ''
-            status_by_orig[r['orig_no']] = ('採用', merged_note)
+            notes = []
+            if any(r.get(k) for k in ['連名①','連名②','連名③','連名④','連名⑤']):
+                notes.append('連名統合済み')
+            warns = r.get('警告') or []
+            notes.extend(warns)
+            if warns:
+                status_by_orig[r['orig_no']] = ('採用（要確認）', ' / '.join(notes))
+                warn_count += 1
+                logs.append((r['orig_no'], f"要確認: {' / '.join(warns)}"))
+            else:
+                status_by_orig[r['orig_no']] = ('採用', ' / '.join(notes))
 
     # ── Excel出力 ──
     wb = openpyxl.Workbook()
@@ -967,6 +1085,7 @@ def process(file_bytes, progress_callback=None, sheet_name=0, manual_map=None):
         style_header(ws_t.cell(row=1, column=ci, value=h), '7030A0')
     status_fills = {
         '採用': PatternFill('solid', start_color='E2EFDA'),
+        '採用（要確認）': PatternFill('solid', start_color='FFE699'),
         '連名統合': PatternFill('solid', start_color='FFF2CC'),
         '重複削除': PatternFill('solid', start_color='D9D9D9'),
         'エラー（送付不可）': PatternFill('solid', start_color='FCE4D6'),
@@ -1014,6 +1133,8 @@ def process(file_bytes, progress_callback=None, sheet_name=0, manual_map=None):
         '郵便番号補完件数': postal_fill_count,
         '連名統合件数': merge_count,
         '文字化け検出件数': garbled_count,
+        '郵便番号修正件数': postal_fix_count,
+        '要確認件数': warn_count,
     }
     error_list = [
         {'行番号': e['orig_no'], 'オーナー名': e.get('オーナー名',''), 'エラー理由': e.get('エラー理由','')}
